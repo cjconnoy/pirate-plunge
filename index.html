@@ -15,18 +15,19 @@
 <script>
 'use strict';
 // ============================================================
-// PIRATE PLUNGE — 30-second cave water-slide lane runner
-// Goonies-inspired vibe prototype. One file, no assets.
-// Tap left / middle / right to pick your channel down the chute.
+// PIRATE PLUNGE v2 — competitive 30s cave water-slide race
+// You vs 2 CPU riders. Three separate chutes; cross between
+// them only at junction gaps. Hazards & boosted rivals knock
+// you out for a couple of seconds (blink + drift). Nobody
+// dies — race for PLACE + LOOT. Fixed track layout (seeded),
+// RNG starting chutes. One file, no assets.
 // ============================================================
 
 const cv = document.getElementById('c');
 const ctx = cv.getContext('2d');
 
-// Logical coordinate space: width fixed, height follows device aspect.
 const W = 420;
 let H = 740;
-
 function fit() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const aw = window.innerWidth, ah = window.innerHeight;
@@ -39,36 +40,41 @@ window.addEventListener('resize', fit);
 fit();
 
 // ---------- tuning ----------
-const SLIDE_W   = 330;                 // total chute width
+const SLIDE_W   = 336;
 const LANE_W    = SLIDE_W / 3;
-const SLIDE_X   = (W - SLIDE_W) / 2;   // left edge of chute
-const PLAYER_Y  = () => H * 0.30;      // player sits near top; track scrolls up past them
-const BASE_SPD  = 520;                 // px/s at start
-const MAX_SPD   = 800;                 // px/s near the bottom
-const TRACK_LEN = 18500;               // ~30s at avg speed
-const HIT_SLOW  = 0.55;                // speed multiplier right after a hit
+const SLIDE_X   = (W - SLIDE_W) / 2;
+const PLAYER_Y  = () => H * 0.30;
+const BASE_SPD  = 520;
+const MAX_SPD   = 800;
+const TRACK_LEN = 18500;
+const JUNC_GAP  = 620;               // distance between junction gates
+const JUNC_HALF = 70;                // gap half-height in the ridge walls
+const STUN_DUR  = 2.0;               // knockout blink time
+const STUN_MUL  = 0.35;
+const GRACE     = 0.5;               // post-stun mercy
+const BOOST_DUR = 1.8;
 const BOOST_MUL = 1.5;
-const BOOST_DUR = 2.0;
-const INVULN    = 1.1;                 // s of mercy after a hit
 
 const laneX = l => SLIDE_X + LANE_W * (l + 0.5);
 
-// ---------- audio (all synth, no files) ----------
-let AC = null, whoosh = null, whooshGain = null;
+// junction gate positions (fixed)
+const junctions = [];
+for (let d = 600; d < TRACK_LEN - 800; d += JUNC_GAP) junctions.push(d);
+
+// ---------- audio (all synth) ----------
+let AC = null, whooshGain = null;
 function audioInit() {
   if (AC) return;
   try {
     AC = new (window.AudioContext || window.webkitAudioContext)();
-    // looping filtered noise = water rush, gain tied to speed
-    const len = AC.sampleRate * 1.5;
-    const buf = AC.createBuffer(1, len, AC.sampleRate);
+    const len = AC.sampleRate * 1.5, buf = AC.createBuffer(1, len, AC.sampleRate);
     const d = buf.getChannelData(0);
     for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-    whoosh = AC.createBufferSource(); whoosh.buffer = buf; whoosh.loop = true;
+    const src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
     const f = AC.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 700; f.Q.value = 0.6;
     whooshGain = AC.createGain(); whooshGain.gain.value = 0;
-    whoosh.connect(f); f.connect(whooshGain); whooshGain.connect(AC.destination);
-    whoosh.start();
+    src.connect(f); f.connect(whooshGain); whooshGain.connect(AC.destination);
+    src.start();
   } catch (e) { AC = null; }
 }
 function beep(freq, dur, type = 'square', vol = 0.14, slideTo = 0) {
@@ -95,79 +101,107 @@ const sfx = {
   gem:    () => { beep(660, 0.10, 'square', 0.10); setTimeout(() => beep(880, 0.10, 'square', 0.10), 70); setTimeout(() => beep(1320, 0.16, 'square', 0.10), 140); },
   shield: () => beep(520, 0.25, 'triangle', 0.16, 780),
   boost:  () => beep(220, 0.45, 'sawtooth', 0.14, 880),
-  hit:    () => { beep(140, 0.25, 'sawtooth', 0.22, 60); noiseBurst(0.18, 0.25, 600); },
+  stun:   () => { beep(140, 0.25, 'sawtooth', 0.22, 60); noiseBurst(0.18, 0.25, 600); },
+  ko:     () => { beep(180, 0.12, 'square', 0.18, 90); setTimeout(() => beep(520, 0.18, 'square', 0.14, 1040), 90); },
   splash: () => { noiseBurst(0.8, 0.4, 700); beep(300, 0.5, 'sine', 0.12, 80); },
-  lane:   () => noiseBurst(0.06, 0.08, 1400),
+  queue:  () => noiseBurst(0.05, 0.08, 1600),
+  count:  () => beep(440, 0.12, 'square', 0.14),
+  go:     () => beep(660, 0.35, 'square', 0.16, 990),
+  fanfare:() => { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.22, 'square', 0.12), i * 130)); },
 };
 
-// ---------- game state ----------
-let state = 'title';          // title | run | splash | over
-let dist, speed, elapsed, lane, px, hearts, score, coins;
-let shield, boostT, invulnT, hitSlowT, splashT, overT, wipeout;
-let objects, particles, best = +(localStorage.getItem('pp_best') || 0);
-
+// ---------- fixed track layout (seeded — same every run) ----------
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
 function buildTrack() {
-  // Spawn table over track distance. Every hazard row keeps >=1 safe lane.
+  const R = mulberry32(1337);        // change seed → new fixed layout
   const objs = [];
-  let d = 900;
-  let special = 0;
-  while (d < TRACK_LEN - 900) {
-    const t = d / TRACK_LEN;                          // difficulty ramp 0..1
-    const nHaz = Math.random() < 0.15 + t * 0.5 ? 2 : 1;
-    const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);
-    const hazTypes = ['rock', 'spikes', 'hole'];
-    for (let i = 0; i < nHaz; i++) {
-      objs.push({ d, lane: lanes[i], type: hazTypes[(Math.random() * 3) | 0], hazard: true, alive: true });
+  for (let i = 0; i < junctions.length - 1; i++) {
+    const a = junctions[i] + 150, b = junctions[i + 1] - 100;
+    const t = a / TRACK_LEN;
+    const safe = (R() * 3) | 0;                          // one clean chute per segment
+    for (let lane = 0; lane < 3; lane++) {
+      if (lane === safe) continue;
+      if (R() < 0.55 + t * 0.35) {
+        const type = ['rock', 'spikes', 'hole'][(R() * 3) | 0];
+        objs.push({ d: a + R() * (b - a), lane, type, hazard: true, alive: true });
+      }
     }
-    const safe = lanes[nHaz];                          // guaranteed safe lane
-    // coin string in the safe lane, most rows
-    if (Math.random() < 0.65) {
-      for (let k = 0; k < 3; k++) objs.push({ d: d + 70 + k * 55, lane: safe, type: 'coin', alive: true });
+    // coin string, biased to the safe chute
+    if (R() < 0.7) {
+      const cl = R() < 0.6 ? safe : (R() * 3) | 0;
+      const cd = a + R() * (b - a - 130);
+      for (let k = 0; k < 3; k++) objs.push({ d: cd + k * 55, lane: cl, type: 'coin', alive: true });
     }
-    // sprinkle a special every ~1600px
-    special += 300 + Math.random() * 90;
-    if (special > 1600) {
-      special = 0;
-      const kind = ['gem', 'shield', 'boost', 'gem'][(Math.random() * 4) | 0];
-      objs.push({ d: d + 160, lane: (Math.random() * 3) | 0, type: kind, alive: true });
+    // special every ~3rd segment
+    if (i % 3 === 1) {
+      const kind = ['gem', 'shield', 'boost', 'gem'][(R() * 4) | 0];
+      objs.push({ d: a + R() * (b - a), lane: (R() * 3) | 0, type: kind, alive: true });
     }
-    d += 320 + Math.random() * 140 - t * 60;           // rows tighten as you descend
   }
   return objs;
 }
 
+// ---------- riders ----------
+const RIDER_DEFS = [
+  { name: 'YOU',     shirt: '#2fa7a0', bandana: '#d23b2e', cpu: false },
+  { name: 'ONE-EYE', shirt: '#c96a1e', bandana: '#2e7d32', cpu: true },
+  { name: 'SQUID',   shirt: '#7b4fd0', bandana: '#ffd23f', cpu: true },
+];
+
+let state = 'title';      // title | count | run | splash | over
+let riders, objects, particles, elapsed, countT, splashT, overT, finishOrder;
+let best = +(localStorage.getItem('pp_best') || 0);
+
 function reset() {
-  dist = 0; speed = BASE_SPD; elapsed = 0;
-  lane = 1; px = laneX(1);
-  hearts = 3; score = 0; coins = 0;
-  shield = false; boostT = 0; invulnT = 0; hitSlowT = 0; splashT = 0; overT = 0; wipeout = false;
   objects = buildTrack();
   particles = [];
+  elapsed = 0; countT = 0; splashT = 0; overT = 0;
+  finishOrder = [];
+  const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);   // RNG starting chutes
+  riders = RIDER_DEFS.map((def, i) => ({
+    ...def,
+    lane: lanes[i], px: laneX(lanes[i]),
+    dist: 0, speed: 0,
+    queued: 0, nextJunc: 0, decidedJunc: -1,
+    stunT: 0, graceT: 0, boostT: 0, bounceT: 0, shield: false,
+    coins: 0, score: 0, kos: 0,
+    finished: false, place: 0, time: 0,
+    pace: def.cpu ? 0.99 + Math.random() * 0.02 : 1.0,       // tiny per-run CPU variance
+  }));
 }
+const player = () => riders[0];
 
-// ---------- input ----------
-function pickLane(clientX) {
-  const rect = cv.getBoundingClientRect();
-  const x = (clientX - rect.left) / rect.width * W;
-  return x < W / 3 ? 0 : x < 2 * W / 3 ? 1 : 2;
+// ---------- input: tap LEFT/RIGHT half = cross that way at next junction ----------
+function queueDir(r, dir) {
+  const target = r.lane + dir;
+  if (target < 0 || target > 2) return;
+  r.queued = dir;
+  if (!r.cpu) sfx.queue();
 }
 function press(clientX) {
   audioInit();
   if (AC && AC.state === 'suspended') AC.resume();
-  if (state === 'title') { reset(); state = 'run'; return; }
-  if (state === 'over' && overT > 0.6) { reset(); state = 'run'; return; }
+  if (state === 'title') { reset(); state = 'count'; return; }
+  if (state === 'over' && overT > 0.6) { reset(); state = 'count'; return; }
   if (state === 'run') {
-    const l = pickLane(clientX);
-    if (l !== lane) { lane = l; sfx.lane(); }
+    const rect = cv.getBoundingClientRect();
+    const x = (clientX - rect.left) / rect.width * W;
+    queueDir(player(), x < W / 2 ? -1 : 1);
   }
 }
 cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e.clientX); });
 window.addEventListener('keydown', e => {
   if (state !== 'run') { if (e.key === ' ' || e.key === 'Enter') press(W / 2); return; }
   audioInit();
-  if (e.key === 'ArrowLeft'  && lane > 0) { lane--; sfx.lane(); }
-  if (e.key === 'ArrowRight' && lane < 2) { lane++; sfx.lane(); }
-  if (e.key === '1') lane = 0; if (e.key === '2') lane = 1; if (e.key === '3') lane = 2;
+  if (e.key === 'ArrowLeft')  queueDir(player(), -1);
+  if (e.key === 'ArrowRight') queueDir(player(), 1);
 });
 
 // ---------- particles ----------
@@ -178,87 +212,168 @@ function spray(x, y, n, col, spread = 3, up = -2) {
   }
 }
 
+// ---------- helpers ----------
+function hazardsInSeg(lane, from, to) {
+  let n = 0;
+  for (const o of objects) if (o.hazard && o.lane === lane && o.d > from && o.d < to) n++;
+  return n;
+}
+function lootInSeg(lane, from, to) {
+  let v = 0;
+  for (const o of objects) {
+    if (o.hazard || !o.alive || o.lane !== lane || o.d < from || o.d > to) continue;
+    v += o.type === 'coin' ? 1 : o.type === 'gem' ? 4 : 3;
+  }
+  return v;
+}
+const riderY = r => PLAYER_Y() + (r.dist - player().dist);
+function stunRider(r, col) {
+  if (r.boostT > 0 || r.stunT > 0 || r.graceT > 0) return false;
+  if (r.shield) { r.shield = false; r.graceT = 0.6; if (!r.cpu) sfx.shield(); spray(r.px, riderY(r), 12, '#7fe9ff', 5, -3); return false; }
+  r.stunT = STUN_DUR; r.queued = 0;
+  spray(r.px, riderY(r), 16, col, 6, -3);
+  return true;
+}
+const rank = r => 1 + riders.filter(o => o !== r && o.dist > r.dist).length;
+
+// ---------- CPU brain: pick a chute at each junction ----------
+function cpuDecide(r, ji) {
+  const from = junctions[ji], to = junctions[ji + 1] || TRACK_LEN;
+  let bestLane = r.lane, bestScore = -1e9;
+  for (let lane = Math.max(0, r.lane - 1); lane <= Math.min(2, r.lane + 1); lane++) {
+    let s = -110 * hazardsInSeg(lane, from, to) + 14 * lootInSeg(lane, from, to);
+    // boosted with a rival ahead in that chute? go hunt the KO
+    if (r.boostT > 0.4) {
+      for (const o of riders) {
+        if (o === r || o.stunT > 0) continue;
+        if (o.lane === lane && o.dist > r.dist && o.dist - r.dist < 500) s += 60;
+      }
+    }
+    s += Math.random() * 18;                              // imperfect pirates
+    if (lane === r.lane) s += 6;                          // slight inertia
+    if (s > bestScore) { bestScore = s; bestLane = lane; }
+  }
+  r.queued = Math.sign(bestLane - r.lane);
+}
+
 // ---------- update ----------
 function update(dt) {
-  if (state === 'run') {
-    elapsed += dt;
-    const ramp = BASE_SPD + (MAX_SPD - BASE_SPD) * Math.min(1, dist / TRACK_LEN);
-    let mul = 1;
-    if (boostT > 0)   { boostT -= dt; mul *= BOOST_MUL; }
-    if (hitSlowT > 0) { hitSlowT -= dt; mul *= HIT_SLOW; }
-    if (invulnT > 0)  invulnT -= dt;
-    speed = ramp * mul;
-    dist += speed * dt;
+  if (state === 'count') {
+    const prev = countT; countT += dt;
+    for (const n of [0.001, 0.5, 1.0]) if (prev < n && countT >= n) sfx.count();
+    if (prev < 1.5 && countT >= 1.5) sfx.go();
+    if (countT >= 1.5) state = 'run';
+  }
+  else if (state === 'run' || state === 'splash') {
+    if (state === 'run') elapsed += dt;
 
-    // steer toward chosen lane
-    const tx = laneX(lane);
-    px += (tx - px) * Math.min(1, dt * 18);
+    for (const r of riders) {
+      if (r.finished) continue;
+      // speed: ramp + boost/stun/bounce + mild rubber-band
+      const ramp = BASE_SPD + (MAX_SPD - BASE_SPD) * Math.min(1, r.dist / TRACK_LEN);
+      let mul = r.pace;
+      if (r.boostT > 0)  { r.boostT -= dt; mul *= BOOST_MUL; }
+      if (r.stunT > 0)   { r.stunT -= dt; mul *= STUN_MUL; if (r.stunT <= 0) r.graceT = GRACE; }
+      else if (r.graceT > 0) r.graceT -= dt;
+      if (r.bounceT > 0) { r.bounceT -= dt; mul *= 0.82; }
+      const rk = rank(r);
+      mul *= rk === 1 ? 0.97 : rk === 3 ? 1.06 : 1.0;     // rubber band
+      r.speed = ramp * mul;
+      r.dist += r.speed * dt;
 
-    // water spray behind the sack
-    if (Math.random() < 0.6) spray(px + (Math.random() - 0.5) * 26, PLAYER_Y() + 18, 1, 'rgba(210,240,255,0.8)', 2, -1.2);
+      // junction crossing
+      while (r.nextJunc < junctions.length && r.dist >= junctions[r.nextJunc]) {
+        if (r.queued) { r.lane = Math.max(0, Math.min(2, r.lane + r.queued)); r.queued = 0; }
+        r.nextJunc++;
+      }
+      // CPU decides when a junction approaches
+      if (r.cpu && r.stunT <= 0 && r.nextJunc < junctions.length &&
+          junctions[r.nextJunc] - r.dist < 260 && r.decidedJunc !== r.nextJunc) {
+        r.decidedJunc = r.nextJunc;
+        cpuDecide(r, r.nextJunc);
+      }
+      r.px += (laneX(r.lane) - r.px) * Math.min(1, dt * 12);
 
-    // collisions & pickups
-    const py = PLAYER_Y();
-    for (const o of objects) {
-      if (!o.alive) continue;
-      const oy = py + (o.d - dist);                    // object screen y
-      if (oy < -80 || oy > H + 80) continue;
-      // asymmetric hitboxes: hazards forgiving (esp. mid-dodge), pickups generous
-      const hx = o.hazard ? 38 : 58, hy = o.hazard ? 36 : 48;
-      if (Math.abs(laneX(o.lane) - px) < hx && Math.abs(oy - py) < hy) {
+      // wake spray
+      const ry = riderY(r);
+      if (ry > -40 && ry < H + 40 && Math.random() < 0.5)
+        spray(r.px + (Math.random() - 0.5) * 24, ry + 18, 1, 'rgba(210,240,255,0.8)', 2, -1.2);
+
+      // hazards & pickups
+      for (const o of objects) {
+        if (Math.abs(o.d - r.dist) > 60) continue;
+        if (Math.abs(laneX(o.lane) - r.px) > (o.hazard ? 38 : 58)) continue;
         if (o.hazard) {
-          if (boostT > 0) {                            // boost smashes through
-            o.alive = false; score += 5; spray(px, py, 12, '#ffd23f', 5, -3); sfx.coin();
-          } else if (invulnT <= 0) {
-            o.alive = false;
-            if (shield) { shield = false; sfx.shield(); spray(px, py, 14, '#7fe9ff', 5, -3); invulnT = 0.6; }
-            else {
-              hearts--; invulnT = INVULN; hitSlowT = 0.8; sfx.hit();
-              spray(px, py, 18, '#ff5a4e', 6, -3);
-              if (hearts <= 0) { wipeout = true; state = 'over'; overT = 0; sfx.splash(); }
-            }
-          }
-        } else {
-          o.alive = false;
-          const dbl = boostT > 0 ? 2 : 1;
-          if (o.type === 'coin')   { coins++; score += 10 * dbl; sfx.coin();  spray(px, py - 10, 6, '#ffd23f', 3, -2.5); }
-          if (o.type === 'gem')    { score += 50 * dbl;          sfx.gem();   spray(px, py - 10, 12, '#ff5ad0', 4, -3); }
-          if (o.type === 'shield') { shield = true;              sfx.shield(); }
-          if (o.type === 'boost')  { boostT = BOOST_DUR;         sfx.boost(); }
+          if (Math.abs(o.d - r.dist) < 36 && r.stunT <= 0 && stunRider(r, '#ff5a4e')) { if (!r.cpu) sfx.stun(); }
+        } else if (o.alive && Math.abs(o.d - r.dist) < 48) {
+          o.alive = false;                                 // contested: first rider takes it
+          const dbl = r.boostT > 0 ? 2 : 1;
+          if (o.type === 'coin')   { r.coins++; r.score += 10 * dbl; if (!r.cpu) { sfx.coin(); spray(r.px, ry - 10, 6, '#ffd23f', 3, -2.5); } }
+          if (o.type === 'gem')    { r.score += 50 * dbl; if (!r.cpu) sfx.gem(); spray(r.px, ry - 10, 10, '#ff5ad0', 4, -3); }
+          if (o.type === 'shield') { r.shield = true; if (!r.cpu) sfx.shield(); }
+          if (o.type === 'boost')  { r.boostT = BOOST_DUR; if (!r.cpu) sfx.boost(); }
         }
+      }
+
+      // finish line
+      if (r.dist >= TRACK_LEN && !r.finished) {
+        r.finished = true; r.time = elapsed;
+        finishOrder.push(r); r.place = finishOrder.length;
+        r.score += [100, 50, 25][r.place - 1] || 0;
+        if (!r.cpu) { state = 'splash'; splashT = 0; sfx.splash(); }
       }
     }
 
-    if (dist >= TRACK_LEN) { state = 'splash'; splashT = 0; sfx.splash(); }
-  }
-  else if (state === 'splash') {
-    splashT += dt;
-    if (splashT < 0.05) for (let i = 0; i < 40; i++) spray(W / 2, H * 0.62, 1, 'rgba(190,230,255,0.9)', 9, -5);
-    if (splashT > 1.4) {
-      score += hearts * 25;                            // heart bonus
-      if (score > best) { best = score; localStorage.setItem('pp_best', best); }
-      state = 'over'; overT = 0;
+    // rider vs rider contact (same chute)
+    for (let i = 0; i < riders.length; i++) for (let j = i + 1; j < riders.length; j++) {
+      const a = riders[i], b = riders[j];
+      if (a.finished || b.finished || a.lane !== b.lane) continue;
+      if (a.stunT > 0 || b.stunT > 0) continue;
+      const gap = Math.abs(a.dist - b.dist);
+      if (gap > 42) continue;
+      const aB = a.boostT > 0, bB = b.boostT > 0;
+      if (aB !== bB) {                                     // boosted rider knocks the other out
+        const hit = aB ? b : a, by = aB ? a : b;
+        if (stunRider(hit, '#ffd23f')) {
+          by.score += 25; by.kos++;
+          sfx.ko();
+          if (!hit.cpu) sfx.stun();
+        }
+      } else {                                             // soft bounce: rear rider checks up
+        const rear = a.dist < b.dist ? a : b;
+        rear.bounceT = 0.4;
+        rear.dist -= (42 - gap) * 0.5;
+        if (!rear.cpu) noiseBurst(0.08, 0.12, 500);
+      }
+    }
+
+    if (state === 'splash') {
+      splashT += dt;
+      if (splashT < 0.05) for (let i = 0; i < 40; i++) spray(W / 2, H * 0.62, 1, 'rgba(190,230,255,0.9)', 9, -5);
+      if (splashT > 1.4) {
+        // resolve stragglers by current position
+        for (const r of [...riders].sort((x, y) => y.dist - x.dist)) {
+          if (!r.finished) { r.finished = true; finishOrder.push(r); r.place = finishOrder.length; r.score += [100, 50, 25][r.place - 1] || 0; }
+        }
+        const p = player();
+        if (p.score > best) { best = p.score; localStorage.setItem('pp_best', best); }
+        state = 'over'; overT = 0;
+        if (p.place === 1) sfx.fanfare();
+      }
     }
   }
-  else if (state === 'over') {
-    overT += dt;
-    if (wipeout && overT === dt && score > best) { best = score; localStorage.setItem('pp_best', best); }
-  }
+  else if (state === 'over') overT += dt;
 
-  // particles
   for (const p of particles) { p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; }
   particles = particles.filter(p => p.life > 0);
-
-  if (whooshGain) whooshGain.gain.value = state === 'run' ? 0.05 + 0.10 * (speed / MAX_SPD) : 0.015;
+  if (whooshGain) whooshGain.gain.value = state === 'run' ? 0.05 + 0.10 * (player().speed / MAX_SPD) : 0.015;
 }
 
-// ---------- drawing helpers ----------
-function cave() {
-  // background rock
+// ---------- drawing ----------
+function cave(scroll) {
   ctx.fillStyle = '#161009';
   ctx.fillRect(0, 0, W, H);
-  // jagged walls, parallax with distance
-  const off = (dist * 0.9) % 90;
+  const off = (scroll * 0.9) % 90;
   ctx.fillStyle = '#241709';
   for (const side of [0, 1]) {
     ctx.beginPath();
@@ -270,8 +385,7 @@ function cave() {
     ctx.lineTo(side ? W : 0, H);
     ctx.closePath(); ctx.fill();
   }
-  // torches
-  const toff = dist % 620;
+  const toff = scroll % 620;
   for (let y = -toff; y < H + 80; y += 620) {
     for (const tx of [SLIDE_X - 26, W - SLIDE_X + 26]) {
       const fl = 3 + Math.sin(performance.now() * 0.02 + tx) * 2;
@@ -280,7 +394,6 @@ function cave() {
       ctx.beginPath(); ctx.ellipse(tx, y + 2, 6, 9 + fl, 0, 0, 7); ctx.fill();
       ctx.fillStyle = '#ffe08a';
       ctx.beginPath(); ctx.ellipse(tx, y + 4, 3, 5, 0, 0, 7); ctx.fill();
-      // glow
       const g = ctx.createRadialGradient(tx, y, 4, tx, y, 70);
       g.addColorStop(0, 'rgba(255,160,60,0.16)'); g.addColorStop(1, 'rgba(255,160,60,0)');
       ctx.fillStyle = g; ctx.fillRect(tx - 70, y - 70, 140, 140);
@@ -288,37 +401,56 @@ function cave() {
   }
 }
 
-function chute() {
+function chutes(scroll) {
   // stone rim
   ctx.fillStyle = '#4a3418';
   ctx.fillRect(SLIDE_X - 14, 0, SLIDE_W + 28, H);
-  // water
+  // water base
   const g = ctx.createLinearGradient(SLIDE_X, 0, SLIDE_X + SLIDE_W, 0);
   g.addColorStop(0, '#0e5d70'); g.addColorStop(0.5, '#1487a0'); g.addColorStop(1, '#0e5d70');
   ctx.fillStyle = g;
   ctx.fillRect(SLIDE_X, 0, SLIDE_W, H);
-  // lane divider ripples
-  ctx.strokeStyle = 'rgba(255,255,255,0.10)';
-  ctx.lineWidth = 2;
-  for (let i = 1; i < 3; i++) {
-    const x = SLIDE_X + LANE_W * i;
-    ctx.beginPath();
-    for (let y = 0; y <= H; y += 12)
-      ctx.lineTo(x + Math.sin((y + dist) * 0.05) * 3, y);
-    ctx.stroke();
-  }
   // rushing streaks
   ctx.strokeStyle = 'rgba(255,255,255,0.22)';
-  const soff = dist % 140;
+  const soff = scroll % 140;
   for (let y = -soff; y < H; y += 140) {
     for (let i = 0; i < 5; i++) {
       const x = SLIDE_X + 20 + ((i * 73 + y * 1.7) % (SLIDE_W - 40));
-      ctx.beginPath(); ctx.moveTo(x, y + i * 22); ctx.lineTo(x - 3, y + i * 22 + 26 + speed * 0.02); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x, y + i * 22); ctx.lineTo(x - 3, y + i * 22 + 26 + (riders ? player().speed : 0) * 0.02); ctx.stroke();
     }
+  }
+  // ridge walls between chutes — solid rock EXCEPT junction gaps
+  const py = PLAYER_Y(), pd = scroll;
+  ctx.fillStyle = '#3d2a11';
+  for (const bx of [SLIDE_X + LANE_W, SLIDE_X + 2 * LANE_W]) {
+    let prev = -400;                                        // wall start before first junction
+    for (let ji = 0; ji <= junctions.length; ji++) {
+      const jd = ji < junctions.length ? junctions[ji] : TRACK_LEN + 400;
+      const segTop = py + (prev + JUNC_HALF - pd);
+      const segBot = py + (jd - JUNC_HALF - pd);
+      if (segBot > -20 && segTop < H + 20)
+        ctx.fillRect(bx - 5, Math.max(-20, segTop), 10, Math.min(H + 20, segBot) - Math.max(-20, segTop));
+      prev = jd;
+    }
+  }
+  // junction bands: foam + cross-arrows
+  ctx.textAlign = 'center';
+  for (const jd of junctions) {
+    const jy = py + (jd - pd);
+    if (jy < -80 || jy > H + 80) continue;
+    ctx.fillStyle = 'rgba(255,255,255,0.13)';
+    ctx.fillRect(SLIDE_X, jy - JUNC_HALF, SLIDE_W, JUNC_HALF * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    for (let k = 0; k < 8; k++)
+      ctx.fillRect(SLIDE_X + 8 + k * 42 + (scroll % 21), jy - 2 + Math.sin(k + scroll * 0.05) * 8, 18, 3);
+    ctx.fillStyle = 'rgba(255,235,150,0.55)';
+    ctx.font = 'bold 13px system-ui, sans-serif';
+    ctx.fillText('⇄', SLIDE_X + LANE_W, jy + 4);
+    ctx.fillText('⇄', SLIDE_X + 2 * LANE_W, jy + 4);
   }
   // foam edges
   ctx.fillStyle = 'rgba(255,255,255,0.30)';
-  const foff = dist % 26;
+  const foff = scroll % 26;
   for (let y = -foff; y < H; y += 26) {
     ctx.fillRect(SLIDE_X, y, 5, 12);
     ctx.fillRect(SLIDE_X + SLIDE_W - 5, y + 8, 5, 12);
@@ -331,25 +463,24 @@ function drawObject(o, oy) {
   if (o.type === 'rock') {
     ctx.fillStyle = '#6b6b66';
     ctx.beginPath();
-    ctx.moveTo(-30, 14); ctx.lineTo(-22, -14); ctx.lineTo(-4, -24); ctx.lineTo(18, -16);
-    ctx.lineTo(30, 6); ctx.lineTo(16, 18); ctx.closePath(); ctx.fill();
+    ctx.moveTo(-28, 14); ctx.lineTo(-20, -14); ctx.lineTo(-4, -24); ctx.lineTo(16, -16);
+    ctx.lineTo(28, 6); ctx.lineTo(14, 18); ctx.closePath(); ctx.fill();
     ctx.fillStyle = '#84847e';
-    ctx.beginPath(); ctx.moveTo(-14, -14); ctx.lineTo(-4, -22); ctx.lineTo(12, -14); ctx.lineTo(-2, -6); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-12, -14); ctx.lineTo(-4, -22); ctx.lineTo(10, -14); ctx.lineTo(-2, -6); ctx.closePath(); ctx.fill();
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.fillRect(-34, 12, 10, 5); ctx.fillRect(24, 8, 10, 5);   // water piling at base
+    ctx.fillRect(-32, 12, 10, 5); ctx.fillRect(22, 8, 10, 5);
   } else if (o.type === 'spikes') {
     for (let i = -1; i <= 1; i++) {
       ctx.fillStyle = '#7a4a1c';
-      ctx.beginPath(); ctx.moveTo(i * 26 - 9, 16); ctx.lineTo(i * 26, -22); ctx.lineTo(i * 26 + 9, 16); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(i * 24 - 8, 16); ctx.lineTo(i * 24, -22); ctx.lineTo(i * 24 + 8, 16); ctx.closePath(); ctx.fill();
       ctx.fillStyle = '#e8d9b0';
-      ctx.beginPath(); ctx.moveTo(i * 26 - 3, -12); ctx.lineTo(i * 26, -22); ctx.lineTo(i * 26 + 3, -12); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(i * 24 - 3, -12); ctx.lineTo(i * 24, -22); ctx.lineTo(i * 24 + 3, -12); ctx.closePath(); ctx.fill();
     }
   } else if (o.type === 'hole') {
     ctx.fillStyle = 'rgba(4,10,14,0.92)';
-    ctx.beginPath(); ctx.ellipse(0, 0, 40, 22, 0, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, 0, 36, 20, 0, 0, 7); ctx.fill();
     ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.ellipse(0, 0, 40, 22, 0, 0, 7); ctx.stroke();
-    // little skull
+    ctx.beginPath(); ctx.ellipse(0, 0, 36, 20, 0, 0, 7); ctx.stroke();
     ctx.fillStyle = '#ddd5c4';
     ctx.beginPath(); ctx.arc(0, -3, 8, 0, 7); ctx.fill();
     ctx.fillRect(-5, 2, 10, 6);
@@ -378,115 +509,129 @@ function drawObject(o, oy) {
   ctx.restore();
 }
 
-function drawPlayer(x, y, tumble = 0) {
+function drawRider(r, x, y, tumble = 0) {
   ctx.save(); ctx.translate(x, y);
   if (tumble) ctx.rotate(tumble);
-  if (invulnT > 0 && state === 'run' && Math.floor(performance.now() / 90) % 2) ctx.globalAlpha = 0.4;
+  const blink = r.stunT > 0 && Math.floor(performance.now() / 110) % 2;
+  if (blink) ctx.globalAlpha = 0.25;
   // burlap sack
   ctx.fillStyle = '#a8763e';
-  ctx.beginPath(); ctx.ellipse(0, 14, 24, 11, 0, 0, 7); ctx.fill();
-  ctx.strokeStyle = '#7c5527'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(-14, 10); ctx.lineTo(14, 16); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(0, 14, 22, 10, 0, 0, 7); ctx.fill();
   // body
-  ctx.fillStyle = '#2fa7a0';
-  ctx.beginPath(); ctx.ellipse(0, -2, 12, 13, 0, 0, 7); ctx.fill();
-  // arms (up when boosting)
-  ctx.strokeStyle = '#2fa7a0'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-  if (boostT > 0 && state === 'run') {
-    ctx.beginPath(); ctx.moveTo(-9, -6); ctx.lineTo(-18, -22); ctx.moveTo(9, -6); ctx.lineTo(18, -22); ctx.stroke();
-  } else {
-    ctx.beginPath(); ctx.moveTo(-9, -4); ctx.lineTo(-17, 8); ctx.moveTo(9, -4); ctx.lineTo(17, 8); ctx.stroke();
-  }
-  // head + red bandana
+  ctx.fillStyle = r.shirt;
+  ctx.beginPath(); ctx.ellipse(0, -2, 11, 12, 0, 0, 7); ctx.fill();
+  // arms
+  ctx.strokeStyle = r.shirt; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  if (r.boostT > 0) { ctx.beginPath(); ctx.moveTo(-8, -6); ctx.lineTo(-16, -20); ctx.moveTo(8, -6); ctx.lineTo(16, -20); ctx.stroke(); }
+  else { ctx.beginPath(); ctx.moveTo(-8, -4); ctx.lineTo(-15, 8); ctx.moveTo(8, -4); ctx.lineTo(15, 8); ctx.stroke(); }
+  // head + bandana
   ctx.fillStyle = '#e8b88a';
-  ctx.beginPath(); ctx.arc(0, -19, 9, 0, 7); ctx.fill();
-  ctx.fillStyle = '#d23b2e';
-  ctx.beginPath(); ctx.arc(0, -22, 9, Math.PI, 0); ctx.fill();
-  ctx.fillRect(-9, -23, 18, 4);
+  ctx.beginPath(); ctx.arc(0, -18, 8, 0, 7); ctx.fill();
+  ctx.fillStyle = r.bandana;
+  ctx.beginPath(); ctx.arc(0, -21, 8, Math.PI, 0); ctx.fill();
+  ctx.fillRect(-8, -22, 16, 4);
   ctx.globalAlpha = 1;
+  // stun stars
+  if (r.stunT > 0) {
+    ctx.fillStyle = '#ffe08a'; ctx.font = '13px system-ui, sans-serif'; ctx.textAlign = 'center';
+    const a = performance.now() * 0.008;
+    for (let k = 0; k < 3; k++) ctx.fillText('✦', Math.cos(a + k * 2.1) * 20, -28 + Math.sin(a + k * 2.1) * 6);
+  }
   // shield bubble
-  if (shield && state === 'run') {
+  if (r.shield) {
     ctx.strokeStyle = 'rgba(127,233,255,0.9)'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(0, -2, 32, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, -2, 28, 0, 7); ctx.stroke();
     ctx.fillStyle = 'rgba(127,233,255,0.12)';
-    ctx.beginPath(); ctx.arc(0, -2, 32, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, -2, 28, 0, 7); ctx.fill();
   }
   // boost flames
-  if (boostT > 0 && state === 'run') {
+  if (r.boostT > 0) {
     ctx.fillStyle = 'rgba(90,255,122,0.7)';
-    ctx.beginPath(); ctx.ellipse(0, 28, 12, 8 + Math.random() * 5, 0, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, 26, 11, 8 + Math.random() * 5, 0, 0, 7); ctx.fill();
   }
+  // name tag
+  ctx.fillStyle = r.cpu ? 'rgba(255,255,255,0.75)' : '#ffd23f';
+  ctx.font = 'bold 10px system-ui, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(r.name, 0, 34);
   ctx.restore();
 }
 
 function ship(x, y, s) {
   ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
-  // hull
   ctx.fillStyle = '#3a2410';
   ctx.beginPath();
   ctx.moveTo(-80, 0); ctx.quadraticCurveTo(-70, 34, -40, 38); ctx.lineTo(46, 38);
   ctx.quadraticCurveTo(84, 30, 92, -8); ctx.lineTo(70, -4); ctx.lineTo(70, 6); ctx.lineTo(-70, 6); ctx.closePath(); ctx.fill();
-  // stern castle
   ctx.fillStyle = '#4a2f14'; ctx.fillRect(46, -26, 34, 30);
   ctx.fillStyle = '#ffd76a';
-  ctx.fillRect(54, -20, 7, 7); ctx.fillRect(66, -20, 7, 7);   // lit windows
-  // masts + sails
+  ctx.fillRect(54, -20, 7, 7); ctx.fillRect(66, -20, 7, 7);
   ctx.fillStyle = '#2c1c0c';
   ctx.fillRect(-38, -110, 5, 112); ctx.fillRect(10, -128, 5, 130);
   ctx.fillStyle = '#d8cdb4';
   ctx.beginPath(); ctx.moveTo(-36, -104); ctx.quadraticCurveTo(-6, -84, -36, -54); ctx.closePath(); ctx.fill();
   ctx.beginPath(); ctx.moveTo(13, -122); ctx.quadraticCurveTo(48, -96, 13, -60); ctx.closePath(); ctx.fill();
   ctx.beginPath(); ctx.moveTo(12, -122); ctx.quadraticCurveTo(-20, -96, 12, -62); ctx.closePath(); ctx.fill();
-  // flag
   ctx.fillStyle = '#1a1a1a';
   ctx.fillRect(15, -140, 22, 12);
   ctx.restore();
 }
 
-function heartsHud() {
-  for (let i = 0; i < 3; i++) {
-    const x = 20 + i * 30, y = 24;
-    ctx.fillStyle = i < hearts ? '#ff5a4e' : 'rgba(255,255,255,0.18)';
-    ctx.beginPath();
-    ctx.arc(x - 5, y - 3, 6, 0, 7); ctx.arc(x + 5, y - 3, 6, 0, 7);
-    ctx.moveTo(x - 11, y); ctx.lineTo(x, y + 12); ctx.lineTo(x + 11, y); ctx.closePath(); ctx.fill();
-  }
-}
-
+const ORD = ['1st', '2nd', '3rd'];
 function hud() {
-  heartsHud();
+  const p = player();
+  const rk = p.finished ? p.place : rank(p);
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 30px system-ui, sans-serif';
+  ctx.fillStyle = rk === 1 ? '#ffd23f' : rk === 2 ? '#cfd8dc' : '#c96a1e';
+  ctx.fillText(ORD[rk - 1], 16, 40);
   ctx.textAlign = 'right';
   ctx.fillStyle = '#ffd23f';
   ctx.font = 'bold 22px system-ui, sans-serif';
-  ctx.fillText(score, W - 18, 32);
+  ctx.fillText(p.score, W - 18, 32);
   ctx.font = '12px system-ui, sans-serif';
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.fillText(elapsed.toFixed(1) + 's', W - 18, 50);
-  // progress rail down the right edge
+  // progress rail: one dot per rider
   const ry0 = 80, ry1 = H - 90;
   ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(W - 10, ry0); ctx.lineTo(W - 10, ry1); ctx.stroke();
-  ctx.fillStyle = '#ffd23f';
-  const p = Math.min(1, dist / TRACK_LEN);
-  ctx.beginPath(); ctx.arc(W - 10, ry0 + (ry1 - ry0) * p, 5, 0, 7); ctx.fill();
+  for (const r of [...riders].reverse()) {
+    ctx.fillStyle = r.cpu ? r.shirt : '#ffd23f';
+    const pr = Math.min(1, r.dist / TRACK_LEN);
+    ctx.beginPath(); ctx.arc(W - 10, ry0 + (ry1 - ry0) * pr, r.cpu ? 4 : 6, 0, 7); ctx.fill();
+  }
   ctx.textAlign = 'center';
   ctx.font = '13px system-ui, sans-serif'; ctx.fillStyle = 'rgba(255,255,255,0.7)';
   ctx.fillText('🏴‍☠️', W - 10, ry1 + 20);
-  if (boostT > 0) {
+  // queued crossing arrow
+  if (p.queued) {
+    ctx.fillStyle = '#5aff7a'; ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.fillText(p.queued < 0 ? '⬅' : '➡', p.px + p.queued * 46, PLAYER_Y() - 34);
+  }
+  if (p.boostT > 0) {
     ctx.fillStyle = '#5aff7a'; ctx.font = 'bold 15px system-ui, sans-serif';
-    ctx.fillText('BOOST!', W / 2, 66);
+    ctx.fillText("BOOST — RAM 'EM!", W / 2, 66);
+  }
+  // off-screen rival markers
+  for (const r of riders) {
+    if (!r.cpu) continue;
+    const ry = riderY(r);
+    if (ry < -30 || ry > H + 30) {
+      const edge = ry < -30 ? 24 : H - 14;
+      ctx.fillStyle = r.shirt;
+      ctx.font = 'bold 13px system-ui, sans-serif';
+      const gap = Math.abs(Math.round((r.dist - p.dist) / 50));
+      ctx.fillText((ry < -30 ? '▲ ' : '▼ ') + r.name + ' ' + gap + 'm', laneX(r.lane), edge);
+    }
   }
 }
 
 function poolScene() {
-  // cavern with lagoon + ship, player splashes in
   ctx.fillStyle = '#0a1622'; ctx.fillRect(0, 0, W, H);
-  // light shaft
   const g = ctx.createLinearGradient(0, 0, 0, H * 0.7);
   g.addColorStop(0, 'rgba(255,235,170,0.18)'); g.addColorStop(1, 'rgba(255,235,170,0)');
   ctx.fillStyle = g;
   ctx.beginPath(); ctx.moveTo(W * 0.3, 0); ctx.lineTo(W * 0.7, 0); ctx.lineTo(W * 0.85, H * 0.7); ctx.lineTo(W * 0.15, H * 0.7); ctx.fill();
-  // water
   ctx.fillStyle = '#0e4a63'; ctx.fillRect(0, H * 0.62, W, H);
   ctx.strokeStyle = 'rgba(255,255,255,0.15)';
   for (let i = 0; i < 6; i++) {
@@ -496,15 +641,24 @@ function poolScene() {
     ctx.stroke();
   }
   ship(W * 0.68, H * 0.62, 1.1);
-  // slide lip top-left
   ctx.fillStyle = '#4a3418'; ctx.fillRect(-10, 0, 120, 46);
   ctx.fillStyle = '#1487a0'; ctx.fillRect(-10, 8, 116, 26);
-  // player arc
+  // riders who beat you bob in the pool; you arc in
+  let bobI = 0;
+  for (const r of riders) {
+    if (!r.cpu) continue;
+    if (r.finished && (r.place && (!player().place || r.place < player().place))) {
+      const bx = W * (0.20 + bobI * 0.13), by = H * 0.68 + Math.sin(performance.now() * 0.003 + bobI * 2) * 4;
+      drawRider(r, bx, by); bobI++;
+    }
+  }
   const t = Math.min(1, splashT / 0.9);
   if (t < 1) {
     const ax = 90 + (W * 0.42 - 90) * t;
     const ay = 30 + (H * 0.62 - 30) * (t * t) - Math.sin(t * Math.PI) * 60;
-    drawPlayer(ax, ay, t * 5);
+    drawRider(player(), ax, ay, t * 5);
+  } else {
+    drawRider(player(), W * 0.42, H * 0.68 + Math.sin(performance.now() * 0.003) * 4);
   }
 }
 
@@ -522,9 +676,8 @@ function centerPanel(lines, cy = H / 2) {
   });
 }
 
-// ---------- render ----------
 function render() {
-  if (state === 'splash' || (state === 'over' && !wipeout)) {
+  if (state === 'splash' || state === 'over') {
     poolScene();
     for (const p of particles) {
       ctx.globalAlpha = Math.max(0, p.life * 2); ctx.fillStyle = p.col;
@@ -532,28 +685,36 @@ function render() {
     }
     ctx.globalAlpha = 1;
     if (state === 'over') {
-      centerPanel([
-        { t: '⚓ YOU MADE THE LAGOON! ⚓', font: 'bold 20px system-ui, sans-serif', col: '#ffd23f' },
-        { t: 'Score ' + score + '   ·   ' + coins + ' doubloons' },
-        { t: 'Heart bonus +' + hearts * 25, col: '#ff8a80' },
-        { t: 'Best ' + best, col: '#7fe9ff' },
-        { t: overT > 0.6 ? 'TAP TO SLIDE AGAIN' : '', col: '#aaa', font: '15px system-ui, sans-serif' },
-      ], H * 0.30);
+      const p = player();
+      const medal = ['🥇', '🥈', '🥉'][p.place - 1];
+      const lines = [
+        { t: medal + ' ' + ORD[p.place - 1].toUpperCase() + ' TO THE LAGOON ' + medal, font: 'bold 19px system-ui, sans-serif', col: p.place === 1 ? '#ffd23f' : '#cfd8dc' },
+      ];
+      for (const r of finishOrder)
+        lines.push({ t: ORD[r.place - 1] + '  ' + r.name + '  —  ' + r.score, col: r.cpu ? r.shirt : '#ffd23f', font: r.cpu ? '16px system-ui, sans-serif' : 'bold 17px system-ui, sans-serif' });
+      lines.push({ t: p.coins + ' doubloons · ' + p.kos + ' KOs · Best ' + best, col: '#7fe9ff', font: '15px system-ui, sans-serif' });
+      lines.push({ t: overT > 0.6 ? 'TAP TO RACE AGAIN' : '', col: '#aaa', font: '15px system-ui, sans-serif' });
+      centerPanel(lines, H * 0.30);
     }
     return;
   }
 
-  cave();
-  chute();
+  const pd = state === 'title' ? 0 : player().dist;
+  cave(pd);
+  chutes(pd);
 
-  const py = PLAYER_Y();
   if (state !== 'title') {
+    const py = PLAYER_Y();
     for (const o of objects) {
-      if (!o.alive) continue;
-      const oy = py + (o.d - dist);
+      if (!o.alive && !o.hazard) continue;
+      const oy = py + (o.d - pd);
       if (oy > -60 && oy < H + 60) drawObject(o, oy);
     }
-    drawPlayer(px, py);
+    // riders; player drawn last (on top)
+    for (const r of [...riders].reverse()) {
+      const ry = riderY(r);
+      if (ry > -50 && ry < H + 50) drawRider(r, r.px, ry);
+    }
   }
 
   for (const p of particles) {
@@ -564,23 +725,25 @@ function render() {
 
   if (state === 'run') hud();
 
+  if (state === 'count') {
+    const n = countT < 0.5 ? '3' : countT < 1.0 ? '2' : countT < 1.5 ? '1' : 'GO!';
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 72px system-ui, sans-serif';
+    ctx.fillStyle = '#ffd23f';
+    ctx.fillText(n, W / 2, H * 0.45);
+  }
+
   if (state === 'title') {
-    drawPlayer(W / 2, py);
+    drawRider({ name: 'YOU', shirt: '#2fa7a0', bandana: '#d23b2e', cpu: false, stunT: 0, boostT: 0, shield: false }, W / 2, PLAYER_Y());
     centerPanel([
       { t: '🏴‍☠️ PIRATE PLUNGE 🏴‍☠️', font: 'bold 24px system-ui, sans-serif', col: '#ffd23f' },
-      { t: '30 seconds down the chute.' },
-      { t: 'Tap LEFT · MIDDLE · RIGHT to pick a path.' },
-      { t: 'Dodge rocks, spikes & holes. Grab loot.', col: '#7fe9ff' },
+      { t: 'Race 2 rival riders to the lagoon.' },
+      { t: 'Tap LEFT / RIGHT to cross chutes', col: '#5aff7a' },
+      { t: 'at the next ⇄ junction.', col: '#5aff7a' },
+      { t: 'Hazards knock you out for 2s.', col: '#ff8a80' },
+      { t: 'Grab BOOST and ram your rivals!', col: '#7fe9ff' },
       { t: 'Best ' + best, col: '#ff8a80' },
       { t: 'TAP TO DROP IN', font: 'bold 18px system-ui, sans-serif', col: '#5aff7a' },
-    ]);
-  }
-  if (state === 'over' && wipeout) {
-    centerPanel([
-      { t: '💀 WIPED OUT 💀', font: 'bold 24px system-ui, sans-serif', col: '#ff5a4e' },
-      { t: Math.round(dist / TRACK_LEN * 100) + '% of the way down' },
-      { t: 'Score ' + score + '   ·   Best ' + best, col: '#ffd23f' },
-      { t: overT > 0.6 ? 'TAP TO TRY AGAIN' : '', col: '#aaa', font: '15px system-ui, sans-serif' },
     ]);
   }
 }
