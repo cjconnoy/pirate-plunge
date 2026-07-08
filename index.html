@@ -15,12 +15,13 @@
 <script>
 'use strict';
 // ============================================================
-// PIRATE PLUNGE v2 — competitive 30s cave water-slide race
-// You vs 2 CPU riders. Three separate chutes; cross between
-// them only at junction gaps. Hazards & boosted rivals knock
-// you out for a couple of seconds (blink + drift). Nobody
-// dies — race for PLACE + LOOT. Fixed track layout (seeded),
-// RNG starting chutes. One file, no assets.
+// PIRATE PLUNGE v3 — competitive 30s cave water-slide race
+// Open slide, tap L/M/R to steer instantly. Short walled FORK
+// sections split the slide into 3 channels — pick one before
+// the walls close in, ride it out locked. One clean channel,
+// one loot channel, one trap channel per fork.
+// You vs 2 CPU riders; hazards & boosted rams = 2s blink-out.
+// Fixed seeded layout, RNG starting lanes. One file, no assets.
 // ============================================================
 
 const cv = document.getElementById('c');
@@ -47,19 +48,14 @@ const PLAYER_Y  = () => H * 0.30;
 const BASE_SPD  = 520;
 const MAX_SPD   = 800;
 const TRACK_LEN = 18500;
-const JUNC_GAP  = 620;               // distance between junction gates
-const JUNC_HALF = 70;                // gap half-height in the ridge walls
-const STUN_DUR  = 2.0;               // knockout blink time
+const STUN_DUR  = 2.0;
 const STUN_MUL  = 0.35;
-const GRACE     = 0.5;               // post-stun mercy
+const GRACE     = 0.5;
 const BOOST_DUR = 1.8;
 const BOOST_MUL = 1.5;
+const LOCK_PRE  = 90;                 // walls "close" this far before a fork starts
 
 const laneX = l => SLIDE_X + LANE_W * (l + 0.5);
-
-// junction gate positions (fixed)
-const junctions = [];
-for (let d = 600; d < TRACK_LEN - 800; d += JUNC_GAP) junctions.push(d);
 
 // ---------- audio (all synth) ----------
 let AC = null, whooshGain = null;
@@ -104,13 +100,14 @@ const sfx = {
   stun:   () => { beep(140, 0.25, 'sawtooth', 0.22, 60); noiseBurst(0.18, 0.25, 600); },
   ko:     () => { beep(180, 0.12, 'square', 0.18, 90); setTimeout(() => beep(520, 0.18, 'square', 0.14, 1040), 90); },
   splash: () => { noiseBurst(0.8, 0.4, 700); beep(300, 0.5, 'sine', 0.12, 80); },
-  queue:  () => noiseBurst(0.05, 0.08, 1600),
+  lane:   () => noiseBurst(0.06, 0.08, 1400),
+  clank:  () => { beep(90, 0.08, 'square', 0.16, 60); noiseBurst(0.06, 0.14, 400); },
   count:  () => beep(440, 0.12, 'square', 0.14),
   go:     () => beep(660, 0.35, 'square', 0.16, 990),
   fanfare:() => { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.22, 'square', 0.12), i * 130)); },
 };
 
-// ---------- fixed track layout (seeded — same every run) ----------
+// ---------- fixed layout (seeded — same every run) ----------
 function mulberry32(a) {
   return function() {
     a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -119,34 +116,63 @@ function mulberry32(a) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
+function shuffle3(R) {
+  const a = [0, 1, 2];
+  for (let i = 2; i > 0; i--) { const j = (R() * (i + 1)) | 0; [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+
+let sections = [];   // walled fork stretches {start, end, roles:{clean,loot,trap}}
+
 function buildTrack() {
-  const R = mulberry32(1337);        // change seed → new fixed layout
+  const R = mulberry32(4242);        // change seed → new fixed layout
   const objs = [];
-  for (let i = 0; i < junctions.length - 1; i++) {
-    const a = junctions[i] + 150, b = junctions[i + 1] - 100;
-    const t = a / TRACK_LEN;
-    const safe = (R() * 3) | 0;                          // one clean chute per segment
-    for (let lane = 0; lane < 3; lane++) {
-      if (lane === safe) continue;
-      if (R() < 0.55 + t * 0.35) {
-        const type = ['rock', 'spikes', 'hole'][(R() * 3) | 0];
-        objs.push({ d: a + R() * (b - a), lane, type, hazard: true, alive: true });
-      }
+
+  // fork sections: short walled stretches, the tension spikes
+  sections = [];
+  let s = 2400;
+  while (s < TRACK_LEN - 2400) {
+    const len = 1000 + R() * 400;
+    const roles = shuffle3(R);
+    sections.push({ start: s, end: s + len, roles: { clean: roles[0], loot: roles[1], trap: roles[2] } });
+    s += len + 2200 + R() * 900;
+  }
+
+  // open-water rows (skip fork sections + buffer)
+  let d = 700, special = 0;
+  while (d < TRACK_LEN - 900) {
+    const sec = sections.find(x => d > x.start - 300 && d < x.end + 220);
+    if (sec) { d = sec.end + 260; continue; }
+    const t = d / TRACK_LEN;
+    const nHaz = R() < 0.15 + t * 0.5 ? 2 : 1;
+    const lanes = shuffle3(R);
+    for (let i = 0; i < nHaz; i++)
+      objs.push({ d, lane: lanes[i], type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
+    const safe = lanes[nHaz];
+    if (R() < 0.6) for (let k = 0; k < 3; k++) objs.push({ d: d + 70 + k * 55, lane: safe, type: 'coin', alive: true });
+    special += 330;
+    if (special > 1700) {
+      special = 0;
+      objs.push({ d: d + 160, lane: (R() * 3) | 0, type: ['gem', 'shield', 'boost', 'gem'][(R() * 4) | 0], alive: true });
     }
-    // coin string, biased to the safe chute
-    if (R() < 0.7) {
-      const cl = R() < 0.6 ? safe : (R() * 3) | 0;
-      const cd = a + R() * (b - a - 130);
-      for (let k = 0; k < 3; k++) objs.push({ d: cd + k * 55, lane: cl, type: 'coin', alive: true });
-    }
-    // special every ~3rd segment
-    if (i % 3 === 1) {
-      const kind = ['gem', 'shield', 'boost', 'gem'][(R() * 4) | 0];
-      objs.push({ d: a + R() * (b - a), lane: (R() * 3) | 0, type: kind, alive: true });
-    }
+    d += 330 + R() * 130 - t * 50;
+  }
+
+  // fork channel contents: clean / loot / trap
+  for (const sec of sections) {
+    const L = sec.end - sec.start, r = sec.roles;
+    objs.push({ d: sec.start + L * 0.5, lane: r.clean, type: 'coin', alive: true });
+    for (let k = 0; k < 3; k++) objs.push({ d: sec.start + L * (0.25 + k * 0.15), lane: r.loot, type: 'coin', alive: true });
+    objs.push({ d: sec.start + L * 0.82, lane: r.loot, type: 'gem', alive: true });
+    objs.push({ d: sec.start + L * 0.30, lane: r.trap, type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
+    objs.push({ d: sec.start + L * 0.62, lane: r.trap, type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
+    objs.push({ d: sec.start + L * 0.92, lane: r.trap, type: R() < 0.5 ? 'boost' : 'gem', alive: true });
   }
   return objs;
 }
+
+const lockedFor = r => sections.some(x => r.dist > x.start - LOCK_PRE && r.dist < x.end - 50);
+const nextSection = dd => sections.find(x => x.start - LOCK_PRE > dd);
 
 // ---------- riders ----------
 const RIDER_DEFS = [
@@ -164,26 +190,29 @@ function reset() {
   particles = [];
   elapsed = 0; countT = 0; splashT = 0; overT = 0;
   finishOrder = [];
-  const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);   // RNG starting chutes
+  const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);   // RNG starting lanes
   riders = RIDER_DEFS.map((def, i) => ({
     ...def,
     lane: lanes[i], px: laneX(lanes[i]),
-    dist: 0, speed: 0,
-    queued: 0, nextJunc: 0, decidedJunc: -1,
+    dist: 0, speed: 0, aiT: 0, decidedSec: -1,
     stunT: 0, graceT: 0, boostT: 0, bounceT: 0, shield: false,
+    nudgeT: 0, nudgeDir: 0,
     coins: 0, score: 0, kos: 0,
-    finished: false, place: 0, time: 0,
-    pace: def.cpu ? 0.99 + Math.random() * 0.02 : 1.0,       // tiny per-run CPU variance
+    finished: false, place: 0,
+    pace: def.cpu ? 0.99 + Math.random() * 0.02 : 1.0,
   }));
 }
 const player = () => riders[0];
 
-// ---------- input: tap LEFT/RIGHT half = cross that way at next junction ----------
-function queueDir(r, dir) {
-  const target = r.lane + dir;
-  if (target < 0 || target > 2) return;
-  r.queued = dir;
-  if (!r.cpu) sfx.queue();
+// ---------- input: tap a lane = steer there NOW (unless walls lock you) ----------
+function steer(r, l) {
+  if (l === r.lane) return;
+  if (lockedFor(r)) {                      // walled in — physical feedback, no move
+    if (!r.cpu) { r.nudgeT = 0.18; r.nudgeDir = Math.sign(l - r.lane); sfx.clank(); }
+    return;
+  }
+  r.lane = Math.max(0, Math.min(2, l > r.lane ? r.lane + 1 : r.lane - 1));
+  if (!r.cpu) sfx.lane();
 }
 function press(clientX) {
   audioInit();
@@ -193,15 +222,16 @@ function press(clientX) {
   if (state === 'run') {
     const rect = cv.getBoundingClientRect();
     const x = (clientX - rect.left) / rect.width * W;
-    queueDir(player(), x < W / 2 ? -1 : 1);
+    steer(player(), x < W / 3 ? 0 : x < 2 * W / 3 ? 1 : 2);
   }
 }
 cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e.clientX); });
 window.addEventListener('keydown', e => {
   if (state !== 'run') { if (e.key === ' ' || e.key === 'Enter') press(W / 2); return; }
   audioInit();
-  if (e.key === 'ArrowLeft')  queueDir(player(), -1);
-  if (e.key === 'ArrowRight') queueDir(player(), 1);
+  const p = player();
+  if (e.key === 'ArrowLeft')  steer(p, p.lane - 1);
+  if (e.key === 'ArrowRight') steer(p, p.lane + 1);
 });
 
 // ---------- particles ----------
@@ -213,12 +243,12 @@ function spray(x, y, n, col, spread = 3, up = -2) {
 }
 
 // ---------- helpers ----------
-function hazardsInSeg(lane, from, to) {
+function hazardsIn(lane, from, to) {
   let n = 0;
   for (const o of objects) if (o.hazard && o.lane === lane && o.d > from && o.d < to) n++;
   return n;
 }
-function lootInSeg(lane, from, to) {
+function lootIn(lane, from, to) {
   let v = 0;
   for (const o of objects) {
     if (o.hazard || !o.alive || o.lane !== lane || o.d < from || o.d > to) continue;
@@ -230,30 +260,60 @@ const riderY = r => PLAYER_Y() + (r.dist - player().dist);
 function stunRider(r, col) {
   if (r.boostT > 0 || r.stunT > 0 || r.graceT > 0) return false;
   if (r.shield) { r.shield = false; r.graceT = 0.6; if (!r.cpu) sfx.shield(); spray(r.px, riderY(r), 12, '#7fe9ff', 5, -3); return false; }
-  r.stunT = STUN_DUR; r.queued = 0;
+  r.stunT = STUN_DUR;
   spray(r.px, riderY(r), 16, col, 6, -3);
   return true;
 }
 const rank = r => 1 + riders.filter(o => o !== r && o.dist > r.dist).length;
 
-// ---------- CPU brain: pick a chute at each junction ----------
-function cpuDecide(r, ji) {
-  const from = junctions[ji], to = junctions[ji + 1] || TRACK_LEN;
-  let bestLane = r.lane, bestScore = -1e9;
-  for (let lane = Math.max(0, r.lane - 1); lane <= Math.min(2, r.lane + 1); lane++) {
-    let s = -110 * hazardsInSeg(lane, from, to) + 14 * lootInSeg(lane, from, to);
-    // boosted with a rival ahead in that chute? go hunt the KO
-    if (r.boostT > 0.4) {
-      for (const o of riders) {
-        if (o === r || o.stunT > 0) continue;
-        if (o.lane === lane && o.dist > r.dist && o.dist - r.dist < 500) s += 60;
+// ---------- CPU brain ----------
+function cpuThink(r, dt) {
+  r.aiT -= dt;
+  if (r.aiT > 0 || r.stunT > 0 || lockedFor(r)) return;
+  r.aiT = 0.22;
+  // fork approaching: commit to the best channel once
+  const sec = sections.find(x => r.dist > x.start - 420 && r.dist < x.start - LOCK_PRE + 10);
+  if (sec) {
+    const si = sections.indexOf(sec);
+    if (r.decidedSec !== si) {
+      r.decidedSec = si;
+      let bestLane = r.lane, bestScore = -1e9;
+      for (let lane = 0; lane < 3; lane++) {
+        let sc = -110 * hazardsIn(lane, sec.start, sec.end) + 14 * lootIn(lane, sec.start, sec.end)
+                 - 8 * Math.abs(lane - r.lane) + Math.random() * 20;
+        if (r.boostT > 0.4) for (const o of riders)
+          if (o !== r && o.stunT <= 0 && o.lane === lane && o.dist > r.dist && o.dist - r.dist < 500) sc += 60;
+        if (sc > bestScore) { bestScore = sc; bestLane = lane; }
       }
-    }
-    s += Math.random() * 18;                              // imperfect pirates
-    if (lane === r.lane) s += 6;                          // slight inertia
-    if (s > bestScore) { bestScore = s; bestLane = lane; }
+      // may need two steps; steer moves one lane per call, aiT re-fires quickly
+      if (bestLane !== r.lane) steer(r, bestLane);
+    } else if (r.decidedSec === si) return;
   }
-  r.queued = Math.sign(bestLane - r.lane);
+  // open water: dodge hazards in my lane
+  if (hazardsIn(r.lane, r.dist + 30, r.dist + 340) > 0) {
+    let bestLane = r.lane, bestScore = -1e9;
+    for (const lane of [r.lane - 1, r.lane + 1]) {
+      if (lane < 0 || lane > 2) continue;
+      const sc = -110 * hazardsIn(lane, r.dist + 30, r.dist + 420) + 10 * lootIn(lane, r.dist, r.dist + 420) + Math.random() * 12;
+      if (sc > bestScore) { bestScore = sc; bestLane = lane; }
+    }
+    if (bestScore > -60) steer(r, bestLane);
+    return;
+  }
+  // boosted? hunt a rival
+  if (r.boostT > 0.4) {
+    for (const o of riders) {
+      if (o === r || o.stunT > 0) continue;
+      if (o.dist > r.dist && o.dist - r.dist < 420 && Math.abs(o.lane - r.lane) === 1) { steer(r, o.lane); return; }
+    }
+  }
+  // greed: hop to a clearly richer adjacent lane
+  for (const lane of [r.lane - 1, r.lane + 1]) {
+    if (lane < 0 || lane > 2) continue;
+    if (hazardsIn(lane, r.dist + 30, r.dist + 380) === 0 &&
+        lootIn(lane, r.dist, r.dist + 380) >= lootIn(r.lane, r.dist, r.dist + 380) + 3 &&
+        Math.random() < 0.6) { steer(r, lane); return; }
+  }
 }
 
 // ---------- update ----------
@@ -269,44 +329,32 @@ function update(dt) {
 
     for (const r of riders) {
       if (r.finished) continue;
-      // speed: ramp + boost/stun/bounce + mild rubber-band
       const ramp = BASE_SPD + (MAX_SPD - BASE_SPD) * Math.min(1, r.dist / TRACK_LEN);
       let mul = r.pace;
       if (r.boostT > 0)  { r.boostT -= dt; mul *= BOOST_MUL; }
       if (r.stunT > 0)   { r.stunT -= dt; mul *= STUN_MUL; if (r.stunT <= 0) r.graceT = GRACE; }
       else if (r.graceT > 0) r.graceT -= dt;
       if (r.bounceT > 0) { r.bounceT -= dt; mul *= 0.82; }
+      if (r.nudgeT > 0)  r.nudgeT -= dt;
       const rk = rank(r);
-      mul *= rk === 1 ? 0.97 : rk === 3 ? 1.06 : 1.0;     // rubber band
+      mul *= rk === 1 ? 0.97 : rk === 3 ? 1.06 : 1.0;
       r.speed = ramp * mul;
       r.dist += r.speed * dt;
 
-      // junction crossing
-      while (r.nextJunc < junctions.length && r.dist >= junctions[r.nextJunc]) {
-        if (r.queued) { r.lane = Math.max(0, Math.min(2, r.lane + r.queued)); r.queued = 0; }
-        r.nextJunc++;
-      }
-      // CPU decides when a junction approaches
-      if (r.cpu && r.stunT <= 0 && r.nextJunc < junctions.length &&
-          junctions[r.nextJunc] - r.dist < 260 && r.decidedJunc !== r.nextJunc) {
-        r.decidedJunc = r.nextJunc;
-        cpuDecide(r, r.nextJunc);
-      }
-      r.px += (laneX(r.lane) - r.px) * Math.min(1, dt * 12);
+      if (r.cpu) cpuThink(r, dt);
+      r.px += (laneX(r.lane) - r.px) * Math.min(1, dt * 20);
 
-      // wake spray
       const ry = riderY(r);
       if (ry > -40 && ry < H + 40 && Math.random() < 0.5)
         spray(r.px + (Math.random() - 0.5) * 24, ry + 18, 1, 'rgba(210,240,255,0.8)', 2, -1.2);
 
-      // hazards & pickups
       for (const o of objects) {
         if (Math.abs(o.d - r.dist) > 60) continue;
         if (Math.abs(laneX(o.lane) - r.px) > (o.hazard ? 38 : 58)) continue;
         if (o.hazard) {
           if (Math.abs(o.d - r.dist) < 36 && r.stunT <= 0 && stunRider(r, '#ff5a4e')) { if (!r.cpu) sfx.stun(); }
         } else if (o.alive && Math.abs(o.d - r.dist) < 48) {
-          o.alive = false;                                 // contested: first rider takes it
+          o.alive = false;
           const dbl = r.boostT > 0 ? 2 : 1;
           if (o.type === 'coin')   { r.coins++; r.score += 10 * dbl; if (!r.cpu) { sfx.coin(); spray(r.px, ry - 10, 6, '#ffd23f', 3, -2.5); } }
           if (o.type === 'gem')    { r.score += 50 * dbl; if (!r.cpu) sfx.gem(); spray(r.px, ry - 10, 10, '#ff5ad0', 4, -3); }
@@ -315,16 +363,15 @@ function update(dt) {
         }
       }
 
-      // finish line
       if (r.dist >= TRACK_LEN && !r.finished) {
-        r.finished = true; r.time = elapsed;
+        r.finished = true;
         finishOrder.push(r); r.place = finishOrder.length;
         r.score += [100, 50, 25][r.place - 1] || 0;
         if (!r.cpu) { state = 'splash'; splashT = 0; sfx.splash(); }
       }
     }
 
-    // rider vs rider contact (same chute)
+    // rider vs rider contact (same lane)
     for (let i = 0; i < riders.length; i++) for (let j = i + 1; j < riders.length; j++) {
       const a = riders[i], b = riders[j];
       if (a.finished || b.finished || a.lane !== b.lane) continue;
@@ -332,14 +379,14 @@ function update(dt) {
       const gap = Math.abs(a.dist - b.dist);
       if (gap > 42) continue;
       const aB = a.boostT > 0, bB = b.boostT > 0;
-      if (aB !== bB) {                                     // boosted rider knocks the other out
+      if (aB !== bB) {
         const hit = aB ? b : a, by = aB ? a : b;
         if (stunRider(hit, '#ffd23f')) {
           by.score += 25; by.kos++;
           sfx.ko();
           if (!hit.cpu) sfx.stun();
         }
-      } else {                                             // soft bounce: rear rider checks up
+      } else {
         const rear = a.dist < b.dist ? a : b;
         rear.bounceT = 0.4;
         rear.dist -= (42 - gap) * 0.5;
@@ -351,7 +398,6 @@ function update(dt) {
       splashT += dt;
       if (splashT < 0.05) for (let i = 0; i < 40; i++) spray(W / 2, H * 0.62, 1, 'rgba(190,230,255,0.9)', 9, -5);
       if (splashT > 1.4) {
-        // resolve stragglers by current position
         for (const r of [...riders].sort((x, y) => y.dist - x.dist)) {
           if (!r.finished) { r.finished = true; finishOrder.push(r); r.place = finishOrder.length; r.score += [100, 50, 25][r.place - 1] || 0; }
         }
@@ -401,11 +447,10 @@ function cave(scroll) {
   }
 }
 
-function chutes(scroll) {
-  // stone rim
+function slide(scroll) {
+  // stone rim + open water
   ctx.fillStyle = '#4a3418';
   ctx.fillRect(SLIDE_X - 14, 0, SLIDE_W + 28, H);
-  // water base
   const g = ctx.createLinearGradient(SLIDE_X, 0, SLIDE_X + SLIDE_W, 0);
   g.addColorStop(0, '#0e5d70'); g.addColorStop(0.5, '#1487a0'); g.addColorStop(1, '#0e5d70');
   ctx.fillStyle = g;
@@ -419,34 +464,32 @@ function chutes(scroll) {
       ctx.beginPath(); ctx.moveTo(x, y + i * 22); ctx.lineTo(x - 3, y + i * 22 + 26 + (riders ? player().speed : 0) * 0.02); ctx.stroke();
     }
   }
-  // ridge walls between chutes — solid rock EXCEPT junction gaps
-  const py = PLAYER_Y(), pd = scroll;
-  ctx.fillStyle = '#3d2a11';
-  for (const bx of [SLIDE_X + LANE_W, SLIDE_X + 2 * LANE_W]) {
-    let prev = -400;                                        // wall start before first junction
-    for (let ji = 0; ji <= junctions.length; ji++) {
-      const jd = ji < junctions.length ? junctions[ji] : TRACK_LEN + 400;
-      const segTop = py + (prev + JUNC_HALF - pd);
-      const segBot = py + (jd - JUNC_HALF - pd);
-      if (segBot > -20 && segTop < H + 20)
-        ctx.fillRect(bx - 5, Math.max(-20, segTop), 10, Math.min(H + 20, segBot) - Math.max(-20, segTop));
-      prev = jd;
+  const py = PLAYER_Y();
+  // FORK sections: walls between lanes only inside sections
+  for (const sec of sections) {
+    const yTop = py + (sec.start - scroll);       // entry (upstream = higher on screen)
+    const yBot = py + (sec.end - scroll);
+    if (yBot < -40 || yTop > H + 40) continue;
+    ctx.fillStyle = '#3d2a11';
+    for (const bx of [SLIDE_X + LANE_W, SLIDE_X + 2 * LANE_W]) {
+      const a = Math.max(-20, yTop), b = Math.min(H + 20, yBot);
+      if (b > a) ctx.fillRect(bx - 5, a, 10, b - a);
+      // entry wedge: wall tapers upstream so the split reads as a fork
+      if (yTop > -40 && yTop < H + 40) {
+        ctx.beginPath(); ctx.moveTo(bx - 5, yTop); ctx.lineTo(bx, yTop - 46); ctx.lineTo(bx + 5, yTop); ctx.closePath(); ctx.fill();
+      }
     }
-  }
-  // junction bands: foam + cross-arrows
-  ctx.textAlign = 'center';
-  for (const jd of junctions) {
-    const jy = py + (jd - pd);
-    if (jy < -80 || jy > H + 80) continue;
-    ctx.fillStyle = 'rgba(255,255,255,0.13)';
-    ctx.fillRect(SLIDE_X, jy - JUNC_HALF, SLIDE_W, JUNC_HALF * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    for (let k = 0; k < 8; k++)
-      ctx.fillRect(SLIDE_X + 8 + k * 42 + (scroll % 21), jy - 2 + Math.sin(k + scroll * 0.05) * 8, 18, 3);
-    ctx.fillStyle = 'rgba(255,235,150,0.55)';
-    ctx.font = 'bold 13px system-ui, sans-serif';
-    ctx.fillText('⇄', SLIDE_X + LANE_W, jy + 4);
-    ctx.fillText('⇄', SLIDE_X + 2 * LANE_W, jy + 4);
+    // entry + exit foam lines
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    if (yTop > -30 && yTop < H + 30) ctx.fillRect(SLIDE_X, yTop - 2, SLIDE_W, 4);
+    if (yBot > -30 && yBot < H + 30) ctx.fillRect(SLIDE_X, yBot - 2, SLIDE_W, 4);
+    // FORK! label upstream of the entry
+    const ly = yTop - 64;
+    if (ly > -20 && ly < H + 20) {
+      ctx.fillStyle = '#ffd23f';
+      ctx.font = 'bold 15px system-ui, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('⚠ FORK ⚠', W / 2, ly);
+    }
   }
   // foam edges
   ctx.fillStyle = 'rgba(255,255,255,0.30)';
@@ -510,46 +553,40 @@ function drawObject(o, oy) {
 }
 
 function drawRider(r, x, y, tumble = 0) {
+  // wall-bump nudge (tap while locked in a fork)
+  if (r.nudgeT > 0) x += Math.sin(r.nudgeT / 0.18 * Math.PI) * 14 * r.nudgeDir;
   ctx.save(); ctx.translate(x, y);
   if (tumble) ctx.rotate(tumble);
   const blink = r.stunT > 0 && Math.floor(performance.now() / 110) % 2;
   if (blink) ctx.globalAlpha = 0.25;
-  // burlap sack
   ctx.fillStyle = '#a8763e';
   ctx.beginPath(); ctx.ellipse(0, 14, 22, 10, 0, 0, 7); ctx.fill();
-  // body
   ctx.fillStyle = r.shirt;
   ctx.beginPath(); ctx.ellipse(0, -2, 11, 12, 0, 0, 7); ctx.fill();
-  // arms
   ctx.strokeStyle = r.shirt; ctx.lineWidth = 5; ctx.lineCap = 'round';
   if (r.boostT > 0) { ctx.beginPath(); ctx.moveTo(-8, -6); ctx.lineTo(-16, -20); ctx.moveTo(8, -6); ctx.lineTo(16, -20); ctx.stroke(); }
   else { ctx.beginPath(); ctx.moveTo(-8, -4); ctx.lineTo(-15, 8); ctx.moveTo(8, -4); ctx.lineTo(15, 8); ctx.stroke(); }
-  // head + bandana
   ctx.fillStyle = '#e8b88a';
   ctx.beginPath(); ctx.arc(0, -18, 8, 0, 7); ctx.fill();
   ctx.fillStyle = r.bandana;
   ctx.beginPath(); ctx.arc(0, -21, 8, Math.PI, 0); ctx.fill();
   ctx.fillRect(-8, -22, 16, 4);
   ctx.globalAlpha = 1;
-  // stun stars
   if (r.stunT > 0) {
     ctx.fillStyle = '#ffe08a'; ctx.font = '13px system-ui, sans-serif'; ctx.textAlign = 'center';
     const a = performance.now() * 0.008;
     for (let k = 0; k < 3; k++) ctx.fillText('✦', Math.cos(a + k * 2.1) * 20, -28 + Math.sin(a + k * 2.1) * 6);
   }
-  // shield bubble
   if (r.shield) {
     ctx.strokeStyle = 'rgba(127,233,255,0.9)'; ctx.lineWidth = 3;
     ctx.beginPath(); ctx.arc(0, -2, 28, 0, 7); ctx.stroke();
     ctx.fillStyle = 'rgba(127,233,255,0.12)';
     ctx.beginPath(); ctx.arc(0, -2, 28, 0, 7); ctx.fill();
   }
-  // boost flames
   if (r.boostT > 0) {
     ctx.fillStyle = 'rgba(90,255,122,0.7)';
     ctx.beginPath(); ctx.ellipse(0, 26, 11, 8 + Math.random() * 5, 0, 0, 7); ctx.fill();
   }
-  // name tag
   ctx.fillStyle = r.cpu ? 'rgba(255,255,255,0.75)' : '#ffd23f';
   ctx.font = 'bold 10px system-ui, sans-serif'; ctx.textAlign = 'center';
   ctx.fillText(r.name, 0, 34);
@@ -591,7 +628,6 @@ function hud() {
   ctx.font = '12px system-ui, sans-serif';
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.fillText(elapsed.toFixed(1) + 's', W - 18, 50);
-  // progress rail: one dot per rider
   const ry0 = 80, ry1 = H - 90;
   ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(W - 10, ry0); ctx.lineTo(W - 10, ry1); ctx.stroke();
@@ -603,27 +639,25 @@ function hud() {
   ctx.textAlign = 'center';
   ctx.font = '13px system-ui, sans-serif'; ctx.fillStyle = 'rgba(255,255,255,0.7)';
   ctx.fillText('🏴‍☠️', W - 10, ry1 + 20);
-  // queued crossing arrow
-  if (p.queued) {
-    ctx.fillStyle = '#5aff7a'; ctx.font = 'bold 26px system-ui, sans-serif';
-    ctx.fillText(p.queued < 0 ? '⬅' : '➡', p.px + p.queued * 46, PLAYER_Y() - 34);
-  }
   if (p.boostT > 0) {
     ctx.fillStyle = '#5aff7a'; ctx.font = 'bold 15px system-ui, sans-serif';
     ctx.fillText("BOOST — RAM 'EM!", W / 2, 66);
+  } else if (lockedFor(p)) {
+    ctx.fillStyle = 'rgba(255,210,63,0.85)'; ctx.font = 'bold 13px system-ui, sans-serif';
+    ctx.fillText('🔒 IN THE FORK', W / 2, 66);
   }
-  // off-screen rival markers
-  for (const r of riders) {
-    if (!r.cpu) continue;
+  riders.forEach((r, i) => {
+    if (!r.cpu) return;
     const ry = riderY(r);
     if (ry < -30 || ry > H + 30) {
       const edge = ry < -30 ? 24 : H - 14;
       ctx.fillStyle = r.shirt;
       ctx.font = 'bold 13px system-ui, sans-serif';
       const gap = Math.abs(Math.round((r.dist - p.dist) / 50));
-      ctx.fillText((ry < -30 ? '▲ ' : '▼ ') + r.name + ' ' + gap + 'm', laneX(r.lane), edge);
+      // fixed slot per rival so markers never overlap each other or the HUD
+      ctx.fillText((ry < -30 ? '▲ ' : '▼ ') + r.name + ' ' + gap + 'm', W * (i === 1 ? 0.38 : 0.68), edge);
     }
-  }
+  });
 }
 
 function poolScene() {
@@ -643,11 +677,10 @@ function poolScene() {
   ship(W * 0.68, H * 0.62, 1.1);
   ctx.fillStyle = '#4a3418'; ctx.fillRect(-10, 0, 120, 46);
   ctx.fillStyle = '#1487a0'; ctx.fillRect(-10, 8, 116, 26);
-  // riders who beat you bob in the pool; you arc in
   let bobI = 0;
   for (const r of riders) {
     if (!r.cpu) continue;
-    if (r.finished && (r.place && (!player().place || r.place < player().place))) {
+    if (r.finished && (!player().place || r.place < player().place)) {
       const bx = W * (0.20 + bobI * 0.13), by = H * 0.68 + Math.sin(performance.now() * 0.003 + bobI * 2) * 4;
       drawRider(r, bx, by); bobI++;
     }
@@ -701,7 +734,7 @@ function render() {
 
   const pd = state === 'title' ? 0 : player().dist;
   cave(pd);
-  chutes(pd);
+  slide(pd);
 
   if (state !== 'title') {
     const py = PLAYER_Y();
@@ -710,7 +743,6 @@ function render() {
       const oy = py + (o.d - pd);
       if (oy > -60 && oy < H + 60) drawObject(o, oy);
     }
-    // riders; player drawn last (on top)
     for (const r of [...riders].reverse()) {
       const ry = riderY(r);
       if (ry > -50 && ry < H + 50) drawRider(r, r.px, ry);
@@ -734,14 +766,14 @@ function render() {
   }
 
   if (state === 'title') {
-    drawRider({ name: 'YOU', shirt: '#2fa7a0', bandana: '#d23b2e', cpu: false, stunT: 0, boostT: 0, shield: false }, W / 2, PLAYER_Y());
+    drawRider({ name: 'YOU', shirt: '#2fa7a0', bandana: '#d23b2e', cpu: false, stunT: 0, boostT: 0, shield: false, nudgeT: 0 }, W / 2, PLAYER_Y());
     centerPanel([
       { t: '🏴‍☠️ PIRATE PLUNGE 🏴‍☠️', font: 'bold 24px system-ui, sans-serif', col: '#ffd23f' },
       { t: 'Race 2 rival riders to the lagoon.' },
-      { t: 'Tap LEFT / RIGHT to cross chutes', col: '#5aff7a' },
-      { t: 'at the next ⇄ junction.', col: '#5aff7a' },
-      { t: 'Hazards knock you out for 2s.', col: '#ff8a80' },
-      { t: 'Grab BOOST and ram your rivals!', col: '#7fe9ff' },
+      { t: 'Tap a lane to steer — instantly.', col: '#5aff7a' },
+      { t: 'At a ⚠ FORK, pick your channel', col: '#ffd23f' },
+      { t: 'before the walls close in!', col: '#ffd23f' },
+      { t: 'Grab BOOST and ram your rivals.', col: '#7fe9ff' },
       { t: 'Best ' + best, col: '#ff8a80' },
       { t: 'TAP TO DROP IN', font: 'bold 18px system-ui, sans-serif', col: '#5aff7a' },
     ]);
