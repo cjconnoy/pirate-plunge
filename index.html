@@ -204,14 +204,17 @@ function reset() {
 }
 const player = () => riders[0];
 
-// ---------- input: tap a lane = steer there NOW (unless walls lock you) ----------
-function steer(r, l) {
-  if (l === r.lane) return;
-  if (lockedFor(r)) {                      // walled in — physical feedback, no move
-    if (!r.cpu) { r.nudgeT = 0.18; r.nudgeDir = Math.sign(l - r.lane); sfx.clank(); }
+// ---------- input: relative steering — each tap shifts one lane that way ----------
+// Two quick taps stack to a two-lane carve. Blocked moves (fork walls, slide
+// edge) give a physical wall-bump nudge instead of silence.
+function steer(r, dir) {                   // dir = -1 | +1
+  if (!dir) return;
+  const target = r.lane + dir;
+  if (lockedFor(r) || target < 0 || target > 2) {
+    if (!r.cpu) { r.nudgeT = 0.18; r.nudgeDir = dir; sfx.clank(); }
     return;
   }
-  r.lane = Math.max(0, Math.min(2, l > r.lane ? r.lane + 1 : r.lane - 1));
+  r.lane = target;
   if (!r.cpu) sfx.lane();
 }
 function press(clientX) {
@@ -222,16 +225,15 @@ function press(clientX) {
   if (state === 'run') {
     const rect = cv.getBoundingClientRect();
     const x = (clientX - rect.left) / rect.width * W;
-    steer(player(), x < W / 3 ? 0 : x < 2 * W / 3 ? 1 : 2);
+    steer(player(), x < W / 2 ? -1 : 1);
   }
 }
 cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e.clientX); });
 window.addEventListener('keydown', e => {
   if (state !== 'run') { if (e.key === ' ' || e.key === 'Enter') press(W / 2); return; }
   audioInit();
-  const p = player();
-  if (e.key === 'ArrowLeft')  steer(p, p.lane - 1);
-  if (e.key === 'ArrowRight') steer(p, p.lane + 1);
+  if (e.key === 'ArrowLeft')  steer(player(), -1);
+  if (e.key === 'ArrowRight') steer(player(), 1);
 });
 
 // ---------- particles ----------
@@ -286,7 +288,7 @@ function cpuThink(r, dt) {
         if (sc > bestScore) { bestScore = sc; bestLane = lane; }
       }
       // may need two steps; steer moves one lane per call, aiT re-fires quickly
-      if (bestLane !== r.lane) steer(r, bestLane);
+      if (bestLane !== r.lane) steer(r, Math.sign(bestLane - r.lane));
     } else if (r.decidedSec === si) return;
   }
   // open water: dodge hazards in my lane
@@ -297,14 +299,14 @@ function cpuThink(r, dt) {
       const sc = -110 * hazardsIn(lane, r.dist + 30, r.dist + 420) + 10 * lootIn(lane, r.dist, r.dist + 420) + Math.random() * 12;
       if (sc > bestScore) { bestScore = sc; bestLane = lane; }
     }
-    if (bestScore > -60) steer(r, bestLane);
+    if (bestScore > -60) steer(r, Math.sign(bestLane - r.lane));
     return;
   }
   // boosted? hunt a rival
   if (r.boostT > 0.4) {
     for (const o of riders) {
       if (o === r || o.stunT > 0) continue;
-      if (o.dist > r.dist && o.dist - r.dist < 420 && Math.abs(o.lane - r.lane) === 1) { steer(r, o.lane); return; }
+      if (o.dist > r.dist && o.dist - r.dist < 420 && Math.abs(o.lane - r.lane) === 1) { steer(r, Math.sign(o.lane - r.lane)); return; }
     }
   }
   // greed: hop to a clearly richer adjacent lane
@@ -312,7 +314,7 @@ function cpuThink(r, dt) {
     if (lane < 0 || lane > 2) continue;
     if (hazardsIn(lane, r.dist + 30, r.dist + 380) === 0 &&
         lootIn(lane, r.dist, r.dist + 380) >= lootIn(r.lane, r.dist, r.dist + 380) + 3 &&
-        Math.random() < 0.6) { steer(r, lane); return; }
+        Math.random() < 0.6) { steer(r, Math.sign(lane - r.lane)); return; }
   }
 }
 
@@ -342,7 +344,7 @@ function update(dt) {
       r.dist += r.speed * dt;
 
       if (r.cpu) cpuThink(r, dt);
-      r.px += (laneX(r.lane) - r.px) * Math.min(1, dt * 20);
+      r.px += (laneX(r.lane) - r.px) * Math.min(1, dt * 22);
 
       const ry = riderY(r);
       if (ry > -40 && ry < H + 40 && Math.random() < 0.5)
@@ -770,7 +772,8 @@ function render() {
     centerPanel([
       { t: '🏴‍☠️ PIRATE PLUNGE 🏴‍☠️', font: 'bold 24px system-ui, sans-serif', col: '#ffd23f' },
       { t: 'Race 2 rival riders to the lagoon.' },
-      { t: 'Tap a lane to steer — instantly.', col: '#5aff7a' },
+      { t: 'Tap LEFT/RIGHT to shift a lane.', col: '#5aff7a' },
+      { t: 'Double-tap to carve two.', col: '#5aff7a' },
       { t: 'At a ⚠ FORK, pick your channel', col: '#ffd23f' },
       { t: 'before the walls close in!', col: '#ffd23f' },
       { t: 'Grab BOOST and ram your rivals.', col: '#7fe9ff' },
