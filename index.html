@@ -7,7 +7,7 @@
 <style>
   html, body { margin:0; padding:0; height:100%; background:#0b0806; overflow:hidden; touch-action:none;
                -webkit-user-select:none; user-select:none; }
-  canvas { display:block; margin:0 auto; height:100%; }
+  canvas { display:block; margin:0 auto; height:100%; touch-action:none; -webkit-tap-highlight-color:transparent; }
 </style>
 </head>
 <body>
@@ -15,13 +15,13 @@
 <script>
 'use strict';
 // ============================================================
-// PIRATE PLUNGE v3 — competitive 30s cave water-slide race
-// Open slide, tap L/M/R to steer instantly. Short walled FORK
-// sections split the slide into 3 channels — pick one before
-// the walls close in, ride it out locked. One clean channel,
-// one loot channel, one trap channel per fork.
+// PIRATE PLUNGE v4 — competitive 30s cave water-slide race
+// ONE fork at the drop-in: pick your chute as the race starts.
+// After that: no lanes, no walls — open water, continuous
+// steering. Thumb-tap left/right strafes a fixed step; taps
+// stack. iOS: raw touchstart (no double-tap-zoom delay).
 // You vs 2 CPU riders; hazards & boosted rams = 2s blink-out.
-// Fixed seeded layout, RNG starting lanes. One file, no assets.
+// Fixed seeded layout, RNG starting chutes. One file, no assets.
 // ============================================================
 
 const cv = document.getElementById('c');
@@ -42,7 +42,7 @@ fit();
 
 // ---------- tuning ----------
 const SLIDE_W   = 336;
-const LANE_W    = SLIDE_W / 3;
+const LANE_W    = SLIDE_W / 3;          // used by the start fork + spawn columns
 const SLIDE_X   = (W - SLIDE_W) / 2;
 const PLAYER_Y  = () => H * 0.30;
 const BASE_SPD  = 520;
@@ -53,7 +53,9 @@ const STUN_MUL  = 0.35;
 const GRACE     = 0.5;
 const BOOST_DUR = 1.8;
 const BOOST_MUL = 1.5;
-const LOCK_PRE  = 90;                 // walls "close" this far before a fork starts
+const DASH      = 96;                   // px strafed per thumb tap
+const EDGE_PAD  = 26;
+const LOCK_PRE  = 90;
 
 const laneX = l => SLIDE_X + LANE_W * (l + 0.5);
 
@@ -100,7 +102,7 @@ const sfx = {
   stun:   () => { beep(140, 0.25, 'sawtooth', 0.22, 60); noiseBurst(0.18, 0.25, 600); },
   ko:     () => { beep(180, 0.12, 'square', 0.18, 90); setTimeout(() => beep(520, 0.18, 'square', 0.14, 1040), 90); },
   splash: () => { noiseBurst(0.8, 0.4, 700); beep(300, 0.5, 'sine', 0.12, 80); },
-  lane:   () => noiseBurst(0.06, 0.08, 1400),
+  dash:   () => noiseBurst(0.06, 0.08, 1400),
   clank:  () => { beep(90, 0.08, 'square', 0.16, 60); noiseBurst(0.06, 0.14, 400); },
   count:  () => beep(440, 0.12, 'square', 0.14),
   go:     () => beep(660, 0.35, 'square', 0.16, 990),
@@ -122,57 +124,53 @@ function shuffle3(R) {
   return a;
 }
 
-let sections = [];   // walled fork stretches {start, end, roles:{clean,loot,trap}}
+// THE start fork — the only walled stretch in the game
+const FORK = { start: 320, end: 1350, roles: null };
 
 function buildTrack() {
-  const R = mulberry32(4242);        // change seed → new fixed layout
+  const R = mulberry32(4242);
   const objs = [];
+  const roles = shuffle3(R);
+  FORK.roles = { clean: roles[0], loot: roles[1], trap: roles[2] };
 
-  // fork sections: short walled stretches, the tension spikes
-  sections = [];
-  let s = 2400;
-  while (s < TRACK_LEN - 2400) {
-    const len = 1000 + R() * 400;
-    const roles = shuffle3(R);
-    sections.push({ start: s, end: s + len, roles: { clean: roles[0], loot: roles[1], trap: roles[2] } });
-    s += len + 2200 + R() * 900;
-  }
+  // start-fork channel contents (no x jitter — channels are narrow)
+  const L = FORK.end - FORK.start, fr = FORK.roles;
+  objs.push({ d: FORK.start + L * 0.55, lane: fr.clean, x: laneX(fr.clean), type: 'coin', alive: true });
+  for (let k = 0; k < 3; k++) objs.push({ d: FORK.start + L * (0.3 + k * 0.18), lane: fr.loot, x: laneX(fr.loot), type: 'coin', alive: true });
+  objs.push({ d: FORK.start + L * 0.85, lane: fr.loot, x: laneX(fr.loot), type: 'gem', alive: true });
+  objs.push({ d: FORK.start + L * 0.45, lane: fr.trap, x: laneX(fr.trap), type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
+  objs.push({ d: FORK.start + L * 0.72, lane: fr.trap, x: laneX(fr.trap), type: 'boost', alive: true });
+  objs.push({ d: FORK.start + L * 0.92, lane: fr.trap, x: laneX(fr.trap), type: 'gem', alive: true });
 
-  // open-water rows (skip fork sections + buffer)
-  let d = 700, special = 0;
+  // open water: everything after the fork, spawn columns + organic jitter
+  let d = FORK.end + 350, special = 0;
   while (d < TRACK_LEN - 900) {
-    const sec = sections.find(x => d > x.start - 300 && d < x.end + 220);
-    if (sec) { d = sec.end + 260; continue; }
     const t = d / TRACK_LEN;
     const nHaz = R() < 0.15 + t * 0.5 ? 2 : 1;
     const lanes = shuffle3(R);
     for (let i = 0; i < nHaz; i++)
-      objs.push({ d, lane: lanes[i], type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
+      objs.push({ d, lane: lanes[i], x: laneX(lanes[i]) + (R() * 2 - 1) * 18,
+                  type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
     const safe = lanes[nHaz];
-    if (R() < 0.6) for (let k = 0; k < 3; k++) objs.push({ d: d + 70 + k * 55, lane: safe, type: 'coin', alive: true });
+    if (R() < 0.6) {
+      const cx = laneX(safe) + (R() * 2 - 1) * 14;
+      for (let k = 0; k < 3; k++) objs.push({ d: d + 70 + k * 55, lane: safe, x: cx, type: 'coin', alive: true });
+    }
     special += 330;
     if (special > 1700) {
       special = 0;
-      objs.push({ d: d + 160, lane: (R() * 3) | 0, type: ['gem', 'shield', 'boost', 'gem'][(R() * 4) | 0], alive: true });
+      const sl = (R() * 3) | 0;
+      objs.push({ d: d + 160, lane: sl, x: laneX(sl) + (R() * 2 - 1) * 16,
+                  type: ['gem', 'shield', 'boost', 'gem'][(R() * 4) | 0], alive: true });
     }
     d += 330 + R() * 130 - t * 50;
-  }
-
-  // fork channel contents: clean / loot / trap
-  for (const sec of sections) {
-    const L = sec.end - sec.start, r = sec.roles;
-    objs.push({ d: sec.start + L * 0.5, lane: r.clean, type: 'coin', alive: true });
-    for (let k = 0; k < 3; k++) objs.push({ d: sec.start + L * (0.25 + k * 0.15), lane: r.loot, type: 'coin', alive: true });
-    objs.push({ d: sec.start + L * 0.82, lane: r.loot, type: 'gem', alive: true });
-    objs.push({ d: sec.start + L * 0.30, lane: r.trap, type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
-    objs.push({ d: sec.start + L * 0.62, lane: r.trap, type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
-    objs.push({ d: sec.start + L * 0.92, lane: r.trap, type: R() < 0.5 ? 'boost' : 'gem', alive: true });
   }
   return objs;
 }
 
-const lockedFor = r => sections.some(x => r.dist > x.start - LOCK_PRE && r.dist < x.end - 50);
-const nextSection = dd => sections.find(x => x.start - LOCK_PRE > dd);
+const inFork = r => r.dist > FORK.start - LOCK_PRE && r.dist < FORK.end - 50;
+const chanOf = x => Math.max(0, Math.min(2, Math.floor((x - SLIDE_X) / LANE_W)));
+const virtLane = r => chanOf(r.tx);
 
 // ---------- riders ----------
 const RIDER_DEFS = [
@@ -190,11 +188,11 @@ function reset() {
   particles = [];
   elapsed = 0; countT = 0; splashT = 0; overT = 0;
   finishOrder = [];
-  const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);   // RNG starting lanes
+  const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);   // RNG starting chutes
   riders = RIDER_DEFS.map((def, i) => ({
     ...def,
-    lane: lanes[i], px: laneX(lanes[i]),
-    dist: 0, speed: 0, aiT: 0, decidedSec: -1,
+    tx: laneX(lanes[i]), px: laneX(lanes[i]),
+    dist: 0, speed: 0, aiT: 0, pickedFork: false,
     stunT: 0, graceT: 0, boostT: 0, bounceT: 0, shield: false,
     nudgeT: 0, nudgeDir: 0,
     coins: 0, score: 0, kos: 0,
@@ -204,33 +202,49 @@ function reset() {
 }
 const player = () => riders[0];
 
-// ---------- input: relative steering — each tap shifts one lane that way ----------
-// Two quick taps stack to a two-lane carve. Blocked moves (fork walls, slide
-// edge) give a physical wall-bump nudge instead of silence.
-function steer(r, dir) {                   // dir = -1 | +1
+// ---------- steering: continuous strafe, taps stack ----------
+function bounds(r) {
+  if (inFork(r)) {                       // walls: stay inside your chute
+    const c = chanOf(r.px);
+    return [SLIDE_X + c * LANE_W + EDGE_PAD, SLIDE_X + (c + 1) * LANE_W - EDGE_PAD];
+  }
+  return [SLIDE_X + EDGE_PAD, SLIDE_X + SLIDE_W - EDGE_PAD];
+}
+function steer(r, dir) {                 // dir = -1 | +1
   if (!dir) return;
-  const target = r.lane + dir;
-  if (lockedFor(r) || target < 0 || target > 2) {
+  const step = r.cpu ? LANE_W : DASH;
+  const [lo, hi] = bounds(r);
+  const nt = Math.max(lo, Math.min(hi, r.tx + dir * step));
+  if (Math.abs(nt - r.tx) < 2) {         // wall or edge — physical feedback
     if (!r.cpu) { r.nudgeT = 0.18; r.nudgeDir = dir; sfx.clank(); }
     return;
   }
-  r.lane = target;
-  if (!r.cpu) sfx.lane();
+  r.tx = nt;
+  if (!r.cpu) sfx.dash();
 }
 function press(clientX) {
   audioInit();
   if (AC && AC.state === 'suspended') AC.resume();
   if (state === 'title') { reset(); state = 'count'; return; }
   if (state === 'over' && overT > 0.6) { reset(); state = 'count'; return; }
-  if (state === 'run') {
+  if (state === 'run' || state === 'count') {   // steer during countdown too — pick your chute
     const rect = cv.getBoundingClientRect();
     const x = (clientX - rect.left) / rect.width * W;
     steer(player(), x < W / 2 ? -1 : 1);
   }
 }
-cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e.clientX); });
+// iOS: raw touchstart = zero tap delay, both thumbs via changedTouches.
+// pointerdown covers mouse/pen only (touch pointers are skipped to avoid double-fire).
+cv.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) press(t.clientX);
+}, { passive: false });
+cv.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'touch') return;
+  e.preventDefault(); press(e.clientX);
+});
 window.addEventListener('keydown', e => {
-  if (state !== 'run') { if (e.key === ' ' || e.key === 'Enter') press(W / 2); return; }
+  if (state !== 'run' && state !== 'count') { if (e.key === ' ' || e.key === 'Enter') press(W / 2); return; }
   audioInit();
   if (e.key === 'ArrowLeft')  steer(player(), -1);
   if (e.key === 'ArrowRight') steer(player(), 1);
@@ -268,53 +282,48 @@ function stunRider(r, col) {
 }
 const rank = r => 1 + riders.filter(o => o !== r && o.dist > r.dist).length;
 
-// ---------- CPU brain ----------
+// ---------- CPU brain (virtual 3-column thinking on a continuous slide) ----------
+function cpuDecide3(r, scoreFn) {
+  const c = virtLane(r);
+  let bestLane = c, bestScore = -1e9;
+  for (let lane = 0; lane < 3; lane++) {
+    const s = scoreFn(lane) - 8 * Math.abs(lane - c) + Math.random() * 18;
+    if (s > bestScore) { bestScore = s; bestLane = lane; }
+  }
+  if (bestLane !== c) steer(r, Math.sign(bestLane - c));
+}
 function cpuThink(r, dt) {
   r.aiT -= dt;
-  if (r.aiT > 0 || r.stunT > 0 || lockedFor(r)) return;
+  if (r.aiT > 0 || r.stunT > 0) return;
   r.aiT = 0.22;
-  // fork approaching: commit to the best channel once
-  const sec = sections.find(x => r.dist > x.start - 420 && r.dist < x.start - LOCK_PRE + 10);
-  if (sec) {
-    const si = sections.indexOf(sec);
-    if (r.decidedSec !== si) {
-      r.decidedSec = si;
-      let bestLane = r.lane, bestScore = -1e9;
-      for (let lane = 0; lane < 3; lane++) {
-        let sc = -110 * hazardsIn(lane, sec.start, sec.end) + 14 * lootIn(lane, sec.start, sec.end)
-                 - 8 * Math.abs(lane - r.lane) + Math.random() * 20;
-        if (r.boostT > 0.4) for (const o of riders)
-          if (o !== r && o.stunT <= 0 && o.lane === lane && o.dist > r.dist && o.dist - r.dist < 500) sc += 60;
-        if (sc > bestScore) { bestScore = sc; bestLane = lane; }
-      }
-      // may need two steps; steer moves one lane per call, aiT re-fires quickly
-      if (bestLane !== r.lane) steer(r, Math.sign(bestLane - r.lane));
-    } else if (r.decidedSec === si) return;
+  // pick a start chute before the fork walls close
+  if (!r.pickedFork && r.dist < FORK.start - LOCK_PRE + 10) {
+    r.pickedFork = true;
+    cpuDecide3(r, lane => -110 * hazardsIn(lane, FORK.start, FORK.end) + 14 * lootIn(lane, FORK.start, FORK.end));
+    return;
   }
-  // open water: dodge hazards in my lane
-  if (hazardsIn(r.lane, r.dist + 30, r.dist + 340) > 0) {
-    let bestLane = r.lane, bestScore = -1e9;
-    for (const lane of [r.lane - 1, r.lane + 1]) {
-      if (lane < 0 || lane > 2) continue;
-      const sc = -110 * hazardsIn(lane, r.dist + 30, r.dist + 420) + 10 * lootIn(lane, r.dist, r.dist + 420) + Math.random() * 12;
-      if (sc > bestScore) { bestScore = sc; bestLane = lane; }
-    }
-    if (bestScore > -60) steer(r, Math.sign(bestLane - r.lane));
+  if (inFork(r)) return;
+  const c = virtLane(r);
+  // dodge hazards ahead in my column
+  if (hazardsIn(c, r.dist + 30, r.dist + 340) > 0) {
+    cpuDecide3(r, lane => lane === c ? -1e5 :
+      -110 * hazardsIn(lane, r.dist + 30, r.dist + 420) + 10 * lootIn(lane, r.dist, r.dist + 420));
     return;
   }
   // boosted? hunt a rival
   if (r.boostT > 0.4) {
     for (const o of riders) {
       if (o === r || o.stunT > 0) continue;
-      if (o.dist > r.dist && o.dist - r.dist < 420 && Math.abs(o.lane - r.lane) === 1) { steer(r, Math.sign(o.lane - r.lane)); return; }
+      if (o.dist > r.dist && o.dist - r.dist < 420 && Math.abs(o.px - r.px) > 30 && Math.abs(o.px - r.px) < 160)
+        { steer(r, Math.sign(o.px - r.px)); return; }
     }
   }
-  // greed: hop to a clearly richer adjacent lane
-  for (const lane of [r.lane - 1, r.lane + 1]) {
+  // greed: hop to a clearly richer adjacent column
+  for (const lane of [c - 1, c + 1]) {
     if (lane < 0 || lane > 2) continue;
     if (hazardsIn(lane, r.dist + 30, r.dist + 380) === 0 &&
-        lootIn(lane, r.dist, r.dist + 380) >= lootIn(r.lane, r.dist, r.dist + 380) + 3 &&
-        Math.random() < 0.6) { steer(r, Math.sign(lane - r.lane)); return; }
+        lootIn(lane, r.dist, r.dist + 380) >= lootIn(c, r.dist, r.dist + 380) + 3 &&
+        Math.random() < 0.6) { steer(r, Math.sign(lane - c)); return; }
   }
 }
 
@@ -324,6 +333,15 @@ function update(dt) {
     const prev = countT; countT += dt;
     for (const n of [0.001, 0.5, 1.0]) if (prev < n && countT >= n) sfx.count();
     if (prev < 1.5 && countT >= 1.5) sfx.go();
+    // riders can pre-position during the countdown
+    for (const r of riders) {
+      if (r.cpu && !r.pickedFork) {
+        r.pickedFork = true;
+        cpuDecide3(r, lane => -110 * hazardsIn(lane, FORK.start, FORK.end) + 14 * lootIn(lane, FORK.start, FORK.end));
+      }
+      if (r.nudgeT > 0) r.nudgeT -= dt;
+      r.px += (r.tx - r.px) * Math.min(1, dt * 24);
+    }
     if (countT >= 1.5) state = 'run';
   }
   else if (state === 'run' || state === 'splash') {
@@ -344,7 +362,10 @@ function update(dt) {
       r.dist += r.speed * dt;
 
       if (r.cpu) cpuThink(r, dt);
-      r.px += (laneX(r.lane) - r.px) * Math.min(1, dt * 22);
+      // clamp target into current bounds (walls may have appeared/gone)
+      const [lo, hi] = bounds(r);
+      r.tx = Math.max(lo, Math.min(hi, r.tx));
+      r.px += (r.tx - r.px) * Math.min(1, dt * 24);
 
       const ry = riderY(r);
       if (ry > -40 && ry < H + 40 && Math.random() < 0.5)
@@ -352,7 +373,7 @@ function update(dt) {
 
       for (const o of objects) {
         if (Math.abs(o.d - r.dist) > 60) continue;
-        if (Math.abs(laneX(o.lane) - r.px) > (o.hazard ? 38 : 58)) continue;
+        if (Math.abs(o.x - r.px) > (o.hazard ? 38 : 58)) continue;
         if (o.hazard) {
           if (Math.abs(o.d - r.dist) < 36 && r.stunT <= 0 && stunRider(r, '#ff5a4e')) { if (!r.cpu) sfx.stun(); }
         } else if (o.alive && Math.abs(o.d - r.dist) < 48) {
@@ -373,11 +394,12 @@ function update(dt) {
       }
     }
 
-    // rider vs rider contact (same lane)
+    // rider vs rider contact (continuous x now)
     for (let i = 0; i < riders.length; i++) for (let j = i + 1; j < riders.length; j++) {
       const a = riders[i], b = riders[j];
-      if (a.finished || b.finished || a.lane !== b.lane) continue;
+      if (a.finished || b.finished) continue;
       if (a.stunT > 0 || b.stunT > 0) continue;
+      if (Math.abs(a.px - b.px) > 34) continue;
       const gap = Math.abs(a.dist - b.dist);
       if (gap > 42) continue;
       const aB = a.boostT > 0, bB = b.boostT > 0;
@@ -450,14 +472,12 @@ function cave(scroll) {
 }
 
 function slide(scroll) {
-  // stone rim + open water
   ctx.fillStyle = '#4a3418';
   ctx.fillRect(SLIDE_X - 14, 0, SLIDE_W + 28, H);
   const g = ctx.createLinearGradient(SLIDE_X, 0, SLIDE_X + SLIDE_W, 0);
   g.addColorStop(0, '#0e5d70'); g.addColorStop(0.5, '#1487a0'); g.addColorStop(1, '#0e5d70');
   ctx.fillStyle = g;
   ctx.fillRect(SLIDE_X, 0, SLIDE_W, H);
-  // rushing streaks
   ctx.strokeStyle = 'rgba(255,255,255,0.22)';
   const soff = scroll % 140;
   for (let y = -soff; y < H; y += 140) {
@@ -466,34 +486,29 @@ function slide(scroll) {
       ctx.beginPath(); ctx.moveTo(x, y + i * 22); ctx.lineTo(x - 3, y + i * 22 + 26 + (riders ? player().speed : 0) * 0.02); ctx.stroke();
     }
   }
+  // THE start fork (only walls in the game)
   const py = PLAYER_Y();
-  // FORK sections: walls between lanes only inside sections
-  for (const sec of sections) {
-    const yTop = py + (sec.start - scroll);       // entry (upstream = higher on screen)
-    const yBot = py + (sec.end - scroll);
-    if (yBot < -40 || yTop > H + 40) continue;
+  const yTop = py + (FORK.start - scroll);
+  const yBot = py + (FORK.end - scroll);
+  if (yBot > -40 && yTop < H + 40) {
     ctx.fillStyle = '#3d2a11';
     for (const bx of [SLIDE_X + LANE_W, SLIDE_X + 2 * LANE_W]) {
       const a = Math.max(-20, yTop), b = Math.min(H + 20, yBot);
       if (b > a) ctx.fillRect(bx - 5, a, 10, b - a);
-      // entry wedge: wall tapers upstream so the split reads as a fork
       if (yTop > -40 && yTop < H + 40) {
         ctx.beginPath(); ctx.moveTo(bx - 5, yTop); ctx.lineTo(bx, yTop - 46); ctx.lineTo(bx + 5, yTop); ctx.closePath(); ctx.fill();
       }
     }
-    // entry + exit foam lines
     ctx.fillStyle = 'rgba(255,255,255,0.35)';
     if (yTop > -30 && yTop < H + 30) ctx.fillRect(SLIDE_X, yTop - 2, SLIDE_W, 4);
     if (yBot > -30 && yBot < H + 30) ctx.fillRect(SLIDE_X, yBot - 2, SLIDE_W, 4);
-    // FORK! label upstream of the entry
     const ly = yTop - 64;
     if (ly > -20 && ly < H + 20) {
       ctx.fillStyle = '#ffd23f';
       ctx.font = 'bold 15px system-ui, sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('⚠ FORK ⚠', W / 2, ly);
+      ctx.fillText('⚠ PICK YOUR CHUTE ⚠', W / 2, ly);
     }
   }
-  // foam edges
   ctx.fillStyle = 'rgba(255,255,255,0.30)';
   const foff = scroll % 26;
   for (let y = -foff; y < H; y += 26) {
@@ -503,7 +518,7 @@ function slide(scroll) {
 }
 
 function drawObject(o, oy) {
-  const x = laneX(o.lane);
+  const x = o.x;
   ctx.save(); ctx.translate(x, oy);
   if (o.type === 'rock') {
     ctx.fillStyle = '#6b6b66';
@@ -555,7 +570,6 @@ function drawObject(o, oy) {
 }
 
 function drawRider(r, x, y, tumble = 0) {
-  // wall-bump nudge (tap while locked in a fork)
   if (r.nudgeT > 0) x += Math.sin(r.nudgeT / 0.18 * Math.PI) * 14 * r.nudgeDir;
   ctx.save(); ctx.translate(x, y);
   if (tumble) ctx.rotate(tumble);
@@ -644,9 +658,9 @@ function hud() {
   if (p.boostT > 0) {
     ctx.fillStyle = '#5aff7a'; ctx.font = 'bold 15px system-ui, sans-serif';
     ctx.fillText("BOOST — RAM 'EM!", W / 2, 66);
-  } else if (lockedFor(p)) {
+  } else if (inFork(p)) {
     ctx.fillStyle = 'rgba(255,210,63,0.85)'; ctx.font = 'bold 13px system-ui, sans-serif';
-    ctx.fillText('🔒 IN THE FORK', W / 2, 66);
+    ctx.fillText('🔒 IN THE CHUTE', W / 2, 66);
   }
   riders.forEach((r, i) => {
     if (!r.cpu) return;
@@ -656,7 +670,6 @@ function hud() {
       ctx.fillStyle = r.shirt;
       ctx.font = 'bold 13px system-ui, sans-serif';
       const gap = Math.abs(Math.round((r.dist - p.dist) / 50));
-      // fixed slot per rival so markers never overlap each other or the HUD
       ctx.fillText((ry < -30 ? '▲ ' : '▼ ') + r.name + ' ' + gap + 'm', W * (i === 1 ? 0.38 : 0.68), edge);
     }
   });
@@ -765,6 +778,9 @@ function render() {
     ctx.font = 'bold 72px system-ui, sans-serif';
     ctx.fillStyle = '#ffd23f';
     ctx.fillText(n, W / 2, H * 0.45);
+    ctx.font = 'bold 16px system-ui, sans-serif';
+    ctx.fillStyle = '#5aff7a';
+    ctx.fillText('tap L / R — pick your chute!', W / 2, H * 0.45 + 40);
   }
 
   if (state === 'title') {
@@ -772,10 +788,9 @@ function render() {
     centerPanel([
       { t: '🏴‍☠️ PIRATE PLUNGE 🏴‍☠️', font: 'bold 24px system-ui, sans-serif', col: '#ffd23f' },
       { t: 'Race 2 rival riders to the lagoon.' },
-      { t: 'Tap LEFT/RIGHT to shift a lane.', col: '#5aff7a' },
-      { t: 'Double-tap to carve two.', col: '#5aff7a' },
-      { t: 'At a ⚠ FORK, pick your channel', col: '#ffd23f' },
-      { t: 'before the walls close in!', col: '#ffd23f' },
+      { t: 'Thumb-tap LEFT / RIGHT to slide over.', col: '#5aff7a' },
+      { t: 'Taps stack — hammer to carve across.', col: '#5aff7a' },
+      { t: 'Pick your chute at the drop-in!', col: '#ffd23f' },
       { t: 'Grab BOOST and ram your rivals.', col: '#7fe9ff' },
       { t: 'Best ' + best, col: '#ff8a80' },
       { t: 'TAP TO DROP IN', font: 'bold 18px system-ui, sans-serif', col: '#5aff7a' },
