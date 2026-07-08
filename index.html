@@ -160,9 +160,9 @@ const inFork = r => r.dist > FORK.start - LOCK_PRE && r.dist < FORK.end - 50;
 
 // ---------- riders ----------
 const RIDER_DEFS = [
-  { name: 'YOU',     shirt: '#2fa7a0', bandana: '#d23b2e', cpu: false },
-  { name: 'ONE-EYE', shirt: '#c96a1e', bandana: '#2e7d32', cpu: true },
-  { name: 'SQUID',   shirt: '#7b4fd0', bandana: '#ffd23f', cpu: true },
+  { name: 'YOU',     shirt: '#2fa7a0', bandana: '#d23b2e', cpu: false, skill: 1 },
+  { name: 'ONE-EYE', shirt: '#c96a1e', bandana: '#2e7d32', cpu: true,  skill: 0.8 },   // sloppier, crashes more
+  { name: 'SQUID',   shirt: '#7b4fd0', bandana: '#ffd23f', cpu: true,  skill: 0.88 },
 ];
 
 let state = 'title';      // title | count | run | splash | over
@@ -183,7 +183,7 @@ function reset() {
     nudgeT: 0, nudgeDir: 0,
     coins: 0, score: 0, kos: 0,
     finished: false, place: 0,
-    pace: def.cpu ? 0.99 + Math.random() * 0.02 : 1.0,
+    pace: def.cpu ? 0.985 + Math.random() * 0.015 : 1.0,   // CPUs never out-pace the player raw
   }));
 }
 const player = () => riders[0];
@@ -275,7 +275,11 @@ function cpuDecide3(r, scoreFn) {
 function cpuThink(r, dt) {
   r.aiT -= dt;
   if (r.aiT > 0 || r.stunT > 0) return;
-  r.aiT = 0.22;
+  r.aiT = 0.28 + Math.random() * 0.1;                    // human-ish reaction time
+  // misjudged hop — pirates fumble
+  if (Math.random() < 0.04 && !inFork(r)) { steer(r, Math.random() < 0.5 ? -1 : 1); return; }
+  // didn't see it — skip this whole think cycle
+  if (Math.random() > r.skill) return;
   // pick a start chute before the fork walls close
   if (!r.pickedFork && r.dist < FORK.start - LOCK_PRE + 10) {
     r.pickedFork = true;
@@ -338,7 +342,9 @@ function update(dt) {
       if (r.bounceT > 0) { r.bounceT -= dt; mul *= 0.82; }
       if (r.nudgeT > 0)  r.nudgeT -= dt;
       const rk = rank(r);
-      mul *= rk === 1 ? 0.97 : rk === 3 ? 1.06 : 1.0;
+      // asymmetric rubber-band: strong tow for the human, capped catch-up for CPUs
+      if (r.cpu) mul *= rk === 1 ? 0.955 : rk === 3 ? 1.045 : 1.0;
+      else       mul *= rk === 1 ? 0.985 : rk === 3 ? 1.08 : 1.02;
       r.speed = ramp * mul;
       r.dist += r.speed * dt;
 
@@ -351,9 +357,9 @@ function update(dt) {
 
       for (const o of objects) {
         if (Math.abs(o.d - r.dist) > 60) continue;
-        if (Math.abs(o.x - r.px) > (o.hazard ? 38 : 58)) continue;
+        if (Math.abs(o.x - r.px) > (o.hazard ? (r.cpu ? 38 : 33) : 58)) continue;
         if (o.hazard) {
-          if (Math.abs(o.d - r.dist) < 36 && r.stunT <= 0 && stunRider(r, '#ff5a4e')) { if (!r.cpu) sfx.stun(); }
+          if (Math.abs(o.d - r.dist) < (r.cpu ? 36 : 31) && r.stunT <= 0 && stunRider(r, '#ff5a4e')) { if (!r.cpu) sfx.stun(); }
         } else if (o.alive && Math.abs(o.d - r.dist) < 48) {
           o.alive = false;
           const dbl = r.boostT > 0 ? 2 : 1;
