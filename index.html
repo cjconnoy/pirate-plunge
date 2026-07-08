@@ -123,22 +123,12 @@ function shuffle3(R) {
 }
 
 // THE start fork — the only walled stretch in the game
-const FORK = { start: 320, end: 1350, roles: null };
+const FORK = { start: 320, end: 1350 };
 
 function buildTrack() {
   const R = mulberry32(4242);
   const objs = [];
-  const roles = shuffle3(R);
-  FORK.roles = { clean: roles[0], loot: roles[1], trap: roles[2] };
-
-  // start-fork channel contents (no x jitter — channels are narrow)
-  const L = FORK.end - FORK.start, fr = FORK.roles;
-  objs.push({ d: FORK.start + L * 0.55, lane: fr.clean, x: laneX(fr.clean), type: 'coin', alive: true });
-  for (let k = 0; k < 3; k++) objs.push({ d: FORK.start + L * (0.3 + k * 0.18), lane: fr.loot, x: laneX(fr.loot), type: 'coin', alive: true });
-  objs.push({ d: FORK.start + L * 0.85, lane: fr.loot, x: laneX(fr.loot), type: 'gem', alive: true });
-  objs.push({ d: FORK.start + L * 0.45, lane: fr.trap, x: laneX(fr.trap), type: ['rock', 'spikes', 'hole'][(R() * 3) | 0], hazard: true, alive: true });
-  objs.push({ d: FORK.start + L * 0.72, lane: fr.trap, x: laneX(fr.trap), type: 'boost', alive: true });
-  objs.push({ d: FORK.start + L * 0.92, lane: fr.trap, x: laneX(fr.trap), type: 'gem', alive: true });
+  // the drop-in fork zone stays completely empty — no hazards, no buffs
 
   // open water: everything after the fork, spawn columns + organic jitter
   let d = FORK.end + 350, special = 0;
@@ -289,7 +279,8 @@ function cpuThink(r, dt) {
   // pick a start chute before the fork walls close
   if (!r.pickedFork && r.dist < FORK.start - LOCK_PRE + 10) {
     r.pickedFork = true;
-    cpuDecide3(r, lane => -110 * hazardsIn(lane, FORK.start, FORK.end) + 14 * lootIn(lane, FORK.start, FORK.end));
+    // empty fork zone — position for the first open-water stretch instead
+    cpuDecide3(r, lane => -110 * hazardsIn(lane, FORK.end, FORK.end + 700) + 14 * lootIn(lane, FORK.end, FORK.end + 700));
     return;
   }
   if (inFork(r)) return;
@@ -327,7 +318,7 @@ function update(dt) {
     for (const r of riders) {
       if (r.cpu && !r.pickedFork) {
         r.pickedFork = true;
-        cpuDecide3(r, lane => -110 * hazardsIn(lane, FORK.start, FORK.end) + 14 * lootIn(lane, FORK.start, FORK.end));
+        cpuDecide3(r, lane => -110 * hazardsIn(lane, FORK.end, FORK.end + 700) + 14 * lootIn(lane, FORK.end, FORK.end + 700));
       }
       if (r.nudgeT > 0) r.nudgeT -= dt;
       r.px += (r.tx - r.px) * Math.min(1, dt * 24);
