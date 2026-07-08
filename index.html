@@ -53,8 +53,6 @@ const STUN_MUL  = 0.35;
 const GRACE     = 0.5;
 const BOOST_DUR = 1.8;
 const BOOST_MUL = 1.5;
-const DASH      = 96;                   // px strafed per thumb tap
-const EDGE_PAD  = 26;
 const LOCK_PRE  = 90;
 
 const laneX = l => SLIDE_X + LANE_W * (l + 0.5);
@@ -169,8 +167,6 @@ function buildTrack() {
 }
 
 const inFork = r => r.dist > FORK.start - LOCK_PRE && r.dist < FORK.end - 50;
-const chanOf = x => Math.max(0, Math.min(2, Math.floor((x - SLIDE_X) / LANE_W)));
-const virtLane = r => chanOf(r.tx);
 
 // ---------- riders ----------
 const RIDER_DEFS = [
@@ -191,7 +187,7 @@ function reset() {
   const lanes = [0, 1, 2].sort(() => Math.random() - 0.5);   // RNG starting chutes
   riders = RIDER_DEFS.map((def, i) => ({
     ...def,
-    tx: laneX(lanes[i]), px: laneX(lanes[i]),
+    pos: lanes[i], tx: laneX(lanes[i]), px: laneX(lanes[i]),
     dist: 0, speed: 0, aiT: 0, pickedFork: false,
     stunT: 0, graceT: 0, boostT: 0, bounceT: 0, shield: false,
     nudgeT: 0, nudgeDir: 0,
@@ -202,24 +198,18 @@ function reset() {
 }
 const player = () => riders[0];
 
-// ---------- steering: continuous strafe, taps stack ----------
-function bounds(r) {
-  if (inFork(r)) {                       // walls: stay inside your chute
-    const c = chanOf(r.px);
-    return [SLIDE_X + c * LANE_W + EDGE_PAD, SLIDE_X + (c + 1) * LANE_W - EDGE_PAD];
-  }
-  return [SLIDE_X + EDGE_PAD, SLIDE_X + SLIDE_W - EDGE_PAD];
-}
+// ---------- steering: three positions, one tap per hop ----------
+// Two taps cross the whole slide. Fork walls and the slide edge
+// block the hop with a physical bump.
 function steer(r, dir) {                 // dir = -1 | +1
   if (!dir) return;
-  const step = r.cpu ? LANE_W : DASH;
-  const [lo, hi] = bounds(r);
-  const nt = Math.max(lo, Math.min(hi, r.tx + dir * step));
-  if (Math.abs(nt - r.tx) < 2) {         // wall or edge — physical feedback
+  const npos = r.pos + dir;
+  if (inFork(r) || npos < 0 || npos > 2) {
     if (!r.cpu) { r.nudgeT = 0.18; r.nudgeDir = dir; sfx.clank(); }
     return;
   }
-  r.tx = nt;
+  r.pos = npos;
+  r.tx = laneX(npos);
   if (!r.cpu) sfx.dash();
 }
 function press(clientX) {
@@ -284,7 +274,7 @@ const rank = r => 1 + riders.filter(o => o !== r && o.dist > r.dist).length;
 
 // ---------- CPU brain (virtual 3-column thinking on a continuous slide) ----------
 function cpuDecide3(r, scoreFn) {
-  const c = virtLane(r);
+  const c = r.pos;
   let bestLane = c, bestScore = -1e9;
   for (let lane = 0; lane < 3; lane++) {
     const s = scoreFn(lane) - 8 * Math.abs(lane - c) + Math.random() * 18;
@@ -303,7 +293,7 @@ function cpuThink(r, dt) {
     return;
   }
   if (inFork(r)) return;
-  const c = virtLane(r);
+  const c = r.pos;
   // dodge hazards ahead in my column
   if (hazardsIn(c, r.dist + 30, r.dist + 340) > 0) {
     cpuDecide3(r, lane => lane === c ? -1e5 :
@@ -362,9 +352,6 @@ function update(dt) {
       r.dist += r.speed * dt;
 
       if (r.cpu) cpuThink(r, dt);
-      // clamp target into current bounds (walls may have appeared/gone)
-      const [lo, hi] = bounds(r);
-      r.tx = Math.max(lo, Math.min(hi, r.tx));
       r.px += (r.tx - r.px) * Math.min(1, dt * 24);
 
       const ry = riderY(r);
@@ -788,8 +775,8 @@ function render() {
     centerPanel([
       { t: '🏴‍☠️ PIRATE PLUNGE 🏴‍☠️', font: 'bold 24px system-ui, sans-serif', col: '#ffd23f' },
       { t: 'Race 2 rival riders to the lagoon.' },
-      { t: 'Thumb-tap LEFT / RIGHT to slide over.', col: '#5aff7a' },
-      { t: 'Taps stack — hammer to carve across.', col: '#5aff7a' },
+      { t: 'Thumb-tap LEFT / RIGHT to hop a lane.', col: '#5aff7a' },
+      { t: 'Two taps = all the way across.', col: '#5aff7a' },
       { t: 'Pick your chute at the drop-in!', col: '#ffd23f' },
       { t: 'Grab BOOST and ram your rivals.', col: '#7fe9ff' },
       { t: 'Best ' + best, col: '#ff8a80' },
